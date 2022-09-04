@@ -3,7 +3,7 @@ from pathlib import Path
 from passlib.context import CryptContext
 import os
 from datetime import datetime, timedelta
-from typing import Union, Any, Optional, List
+from typing import Union, Any, Optional, List, Dict
 from jose import jwt
 from logging import getLogger
 
@@ -71,6 +71,4 @@ def create_token(token_type: str, subject: Union[str, Any], expires_delta: timed
 
     to_encode = {"exp": expires_delta, "sub": str(subject)}
     return jwt.encode(to_encode, JWT_SECRET_KEY, ALGORITHM)
-
-
 

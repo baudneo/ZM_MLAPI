@@ -21,6 +21,7 @@ from fastapi import (
     __version__ as fastapi_version,
 )
 from fastapi.responses import RedirectResponse
+from starlette.requests import Request
 
 from zm_mlapi.schemas import (
     Settings,
@@ -73,17 +74,12 @@ async def docs():
 
 @app.get("/available_models")
 async def available_models():
-    if g.settings.model_dir is None:
-        raise HTTPException(status_code=404, detail="No models directory configured")
-
     return {"models": g.available_models}
 
 
 @app.get("/available_models/{model_uuid}")
 async def available_model(model_uuid: str):
     model_uuid = model_uuid.lower().strip()
-    if g.settings.model_dir is None:
-        raise HTTPException(status_code=404, detail="No models directory configured")
 
     if model_uuid not in g.available_models:
         raise HTTPException(status_code=404, detail="Model not found")
@@ -98,8 +94,6 @@ from fastapi import Path as FastPath, Query
 @app.post("models/create_sequence", description="Create a new model sequence")
 async def create_live_model(sequence: ModelSequence):
     model_uuid = str(sequence.based_on).lower().strip()
-    if g.settings.model_dir is None:
-        raise HTTPException(status_code=404, detail="No models directory configured")
 
     if model_uuid not in g.available_models:
         raise HTTPException(status_code=404, detail="Available model UUID not found")
@@ -111,11 +105,12 @@ async def create_live_model(sequence: ModelSequence):
 
 
 
+
 @app.post("/detect/{model_uuid}", summary="Run detection on an image")
 async def object_detection(
     model_uuid: str = FastPath(description="A valid model UUID"),
     image: UploadFile = File(..., description="Image to run the ML model on"),
-    minimum_confidence: float = Query(
+    min_conf: float = Query(
         0.2,
         le=1.0,
         ge=0.0,
@@ -136,6 +131,8 @@ async def object_detection(
 class MLAPI:
     available_models: list
     cached_settings: Settings
+    env_file: Path
+    server: uvicorn.Server
 
     def __init__(self, env_file: Union[str, Path], run_server: bool = False):
         """
@@ -162,13 +159,10 @@ class MLAPI:
     def read_settings(self):
         if self.env_file.exists():
             g.settings = self.cached_settings = Settings(_env_file=self.env_file)
-            if self.cached_settings.debug:
-                logger.info(f"debug mode enabled")
-                logger.setLevel(logging.DEBUG)
             logger.debug(f"{self.cached_settings = }")
             self.available_models = (
                 g.available_models
-            ) = self.cached_settings.parse_model_dir()
+            ) = self.cached_settings.available_models
         else:
             raise FileNotFoundError(f"'{self.env_file.as_posix()}' does not exist")
 

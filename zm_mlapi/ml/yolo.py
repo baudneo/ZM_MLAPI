@@ -148,6 +148,8 @@ class Yolo:
                         row[2].item(),
                         row[3].item(),
                     )
+                    # x and y are centered of the bbox, so we need to subtract half of the width and height
+                    # to get the top left corner. Scaled to the original image size using factoring.
                     left = int((x - 0.5 * w) * x_factor)
                     top = int((y - 0.5 * h) * y_factor)
                     width = int(w * x_factor)
