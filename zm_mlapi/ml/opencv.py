@@ -5,9 +5,9 @@ from logging import getLogger
 
 # Constants
 from zm_mlapi.utils import str2bool
-from zm_mlapi.schemas import ModelType, ModelFrameWork, ModelProcessor, ModelSequence, FullDetectionSequence, DetectionModel
+from zm_mlapi.schemas import ModelType, ModelFrameWork, ModelProcessor, ModelSequence, ModelOptions, AvailableModel
 
-LP: str = "yolo:"
+LP: str = "DNN:"
 logger = getLogger()
 
 try:
@@ -39,61 +39,74 @@ def cv2_version() -> int:
     return int(maj + min + patch)
 
 
-class Yolo:
-    def __init__(self, options: ModelSequence):
-        # Log Prefix and the global config
-        self.lp = LP
-        if not options:
-            raise ValueError(f"no options passed!")
+class Detector:
+    def __init__(self, model_config: AvailableModel, model_options: ModelOptions):
+        if not model_config:
+            raise ValueError(f"{LP} no config passed!")
         # Model init params
-        self.options: ModelSequence = options
+        self.config: AvailableModel = model_config
+        self.options: ModelOptions = model_options
+        self.processor: ModelProcessor = self.options.processor
+        self.model_name = self.config.name
+        logger.info(f"{LP} initializing...")
 
-        logger.debug(4, f"{LP} initialization params: {self.options}")
+        logger.debug(f"{LP} configuration: {self.config}")
+        logger.debug(f"{LP} options: {self.options}")
 
         self.original_image: Optional[np.ndarray] = None
-        self.version: int = 3
-        self.model_name = "Yolo"
         self.net: Optional[cv2.dnn] = None
-        self.model: Optional[cv2.dnn_DetectionModel] = None
+        self.model: Optional[cv2.dnn.DetectionModel] = None
 
-    def get_sequence_name(self) -> str:
-        return self.options.name
+    @property
+    def temperature(self):
+        print("Getting value...")
+        return self._temperature
+
+    @temperature.setter
+    def temperature(self, value):
+        print("Setting value...")
+        if value < -273.15:
+            raise ValueError("Temperature below -273 is not possible")
+        self._temperature = value
+    @property
+    def options(self):
+        return self._options
+
+    @options.setter
+    def options(self, model_options: ModelOptions):
+        self._options = model_options
+
+    @options.deleter
+    def options(self):
+        self.options = None
+
 
     def get_options(self):
         return self.options
 
-    def get_classes(self):
-        return self.options.labels
 
-    def populate_class_labels(self):
-        if self.options.labels_file:
-            with self.options.labels_file.open("r") as f:
-                self.options.labels = [line.strip() for line in f.readlines()]
+
+    def get_classes(self):
+        return self.config.labels
 
     def load_model(self):
-        logger.debug(f"{LP} loading model data from sequence '{self.options.name}'")
+        logger.debug(f"{LP} loading model data from sequence '{self.model_name}'")
         t = time.perf_counter()
         try:
-            self.net = cv2.dnn.readNet(self.options.model_file, self.options.config_file)
+            self.net = cv2.dnn.readNet(self.config.input, self.config.config)
         except Exception as model_load_exc:
             logger.error(
                 f"{LP} Error while loading model file and/or config! (May need to re-download the model/cfg file) => {model_load_exc}"
             )
             raise ValueError(repr(model_load_exc))
-        self.model = cv2.dnn_DetectionModel(self.net)
+        self.model = cv2.dnn.DetectionModel(self.net)
         self.model.setInputParams(
             scale=1 / 255, size=(self.options.width, self.options.height), swapRB=True
         )
         logger.debug(
-            f"perf:{LP} '{self.options.name}' initialization -> loading "
-            f"'{self.options.model_file}' took: {time.perf_counter() - t:.5f}ms"
+            f"perf:{LP} loading of files and DetectionModel completed in {time.perf_counter() - t:.5f}ms"
         )
-        if self.options.show_name:
-            self.options.name = self.options.show_name
-        else:
-            self.options.name = self.options.model_file.stem
-        logger.debug(f"{LP} model name: {self.options.name}")
-
+        self.options.pr
         if self.options.processor == ModelProcessor.GPU:
             cv_ver = cv2_version()
             # 4.5.4 and above (@pliablepixels tracked down the exact version change

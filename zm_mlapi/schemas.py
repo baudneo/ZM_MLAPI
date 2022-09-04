@@ -4,9 +4,12 @@ import logging
 from pathlib import Path
 from typing import Union, List, Dict, Optional, IO
 
+import numpy as np
 from fastapi import UploadFile, File, Query
 from pydantic import BaseModel, Field, validator, BaseSettings
 from pydantic.fields import ModelField
+
+from zm_mlapi.ml import opencv, face, alpr
 
 logger = logging.getLogger("zm_mlapi")
 
@@ -61,35 +64,35 @@ class ModelType(str, Enum):
     OBJECT = "object"
     FACE = "face"
     ALPR = "alpr"
-    object = OBJECT
-    face = FACE
-    alpr = ALPR
+    DEFAULT = OBJECT
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}.{self.name} ({str(self.name).lower()} detection)"
+
+    def __str__(self):
+        return self.__repr__()
 
 
 class ModelFrameWork(str, Enum):
     OPENCV = "opencv"
     CORAL = "coral"
     PYCORAL = CORAL
-    VINO = "openvino"
-    OPENVINO = VINO
+    # VINO = "openvino"
+    # OPENVINO = VINO
     TENSORFLOW = "tensorflow"
-    TF = TENSORFLOW
     PYTORCH = "pytorch"
     DEEPFACE = "deepface"
-    OPENALPR_CLOUD = "openalpr_cloud"
     OPENALPR = "openalpr"
-    PLATERECOGNIZER = "platerecognizer"
+    DLIB = "dlib"
+    FACE_RECOGNITION = DLIB
+    DEFAULT = OPENCV
 
 
 class ModelProcessor(str, Enum):
     CPU = "cpu"
     GPU = "gpu"
     TPU = "tpu"
-    CLOUD = "cloud"
-    cpu = CPU
-    gpu = GPU
-    tpu = TPU
-    cloud = CLOUD
+    DEFAULT = CPU
 
 
 class DetectionResult(BaseModel):
@@ -100,34 +103,39 @@ class DetectionResult(BaseModel):
     model_name: str = None
 
 
+class ModelThresholds(BaseModel):
+    confidence: float = Field(0.5, ge=0.0, le=1.0, descritpiton="Confidence Threshold")
+    nms: float = Field(
+        0.4, ge=0.0, le=1.0, description="Non-Maximum Suppression Threshold"
+    )
+
+
+class ModelOptions(BaseModel):
+    height: int = Field(
+        416, ge=1, description="Height of the input image (resized for model)"
+    )
+    width: int = Field(
+        416, ge=1, description="Width of the input image (resized for model)"
+    )
+    square: bool = Field(False, description="Zero pad the image to be a square")
+    thresholds: ModelThresholds = Field(
+        default_factory=ModelThresholds, description="Thresholds for the model"
+    )
+    processor: ModelProcessor = Field(None, description="Processor to use for model")
+
+
 class AvailableModel(BaseModel):
-    class DefaultConfig(BaseModel):
-        class Thresholds(BaseModel):
-            confidence: float = Field(
-                0.5, ge=0.0, le=1.0, descritpiton="Confidence Threshold"
-            )
-            nms: float = Field(
-                0.4, ge=0.0, le=1.0, description="Non-Maximum Suppression Threshold"
-            )
-
-        height: int = Field(
-            416, ge=1, description="Height of the input image (resized for model)"
-        )
-        width: int = Field(
-            416, ge=1, description="Width of the input image (resized for model)"
-        )
-        square: bool = Field(False, description="Zero pad the image to be a square")
-        thresholds: Thresholds = Field(
-            default_factory=Thresholds, description="Thresholds for the model"
-        )
-
     id: int = Field(default_factory=uuid.uuid4, description="Unique ID of the model")
     name: str = Field(..., description="model name")
     input: Path = Field(..., description="model file/dir path")
     enabled: bool = Field(True, description="model enabled")
     description: str = Field(None, description="model description")
-    framework: ModelFrameWork = Field(ModelFrameWork.OPENCV, description="model framework")
-    model_type: ModelType = Field(ModelType.OBJECT, description="model type (object, face, alpr)")
+    framework: ModelFrameWork = Field(
+        ModelFrameWork.DEFAULT, description="model framework"
+    )
+    model_type: ModelType = Field(
+        ModelType.DEFAULT, description="model type (object, face, alpr)"
+    )
     classes: Path = Field(default=None, description="model labels file path (Optional)")
     config: Path = Field(default=None, description="model config file path (Optional)")
     labels: List[str] = Field(
@@ -137,8 +145,8 @@ class AvailableModel(BaseModel):
         exclude=True,
     )
 
-    default_config: DefaultConfig = Field(
-        default_factory=DefaultConfig, description="Default Configuration for the model"
+    default_config: ModelOptions = Field(
+        default_factory=ModelOptions, description="Default Configuration for the model"
     )
 
     @validator("framework", pre=True)
@@ -286,6 +294,7 @@ class ModelConfig:
 
     def __repr__(self):
         return f"{self.__class__.__name__}({self.file})->{self.parsed.get('models')}"
+
     def __init__(self, cfg_file: Union[Path, str]):
         self.raw = ""
         self.parsed_raw = {}
@@ -424,6 +433,7 @@ class Settings(BaseSettings):
             for model in models.parsed.get("models"):
                 v.append(AvailableModel(**model))
         return v
+
     @validator("debug")
     def check_debug(cls, v, values):
         if v:
@@ -433,12 +443,14 @@ class Settings(BaseSettings):
             )
             logger.setLevel(logging.DEBUG)
         return v
+
     @validator("models")
     def _validate_model_config(cls, v, field, values):
         model_config = values["model_config"]
         logger.debug(f"parsing model config: {model_config}")
-        v = ModelConfig(model_config)
+        v = ModelOptions(model_config)
         return v
+
     @validator("db_connection_string")
     def _validate_db_connection_string(cls, v, values):
         if not v:
@@ -471,7 +483,7 @@ class Settings(BaseSettings):
     def parse_model_config(self):
         """Parse the model configuration YAML file"""
         logger.debug(f"parsing model config: {self.model_config}")
-        self.models = ModelConfig(self.model_config)
+        self.models = ModelOptions(self.model_config)
 
 
 class GlobalConfig(BaseModel):
@@ -491,36 +503,119 @@ class Detector:
     Specify a processor type and then load the model into processor memory. run inferrence on the processor
     """
 
-    def __init__(self, model_config: AvailableModel, processor: Optional[str] = None):
+    model_source: AvailableModel
+    processor: ModelProcessor
+    options: ModelOptions
+    model: Union[opencv.Detector, face.Face, alpr.Alpr, None]
+
+    def __init__(
+        self,
+        model: AvailableModel,
+        processor: Optional[str] = None,
+        options: Optional[ModelOptions] = None,
+    ):
+        self.options = options
+        self.model_source = model
         if not processor:
-            processor = ModelProcessor.CPU
+            if model.framework == ModelFrameWork.CORAL:
+                processor = "tpu"
+            else:
+                processor = "cpu"
+            logger.debug(
+                f"no processor specified, using {model.framework} default: {processor}"
+            )
         assert isinstance(processor, str), "processor must be a string"
         processor = processor.lower().strip()
-        assert processor in ModelProcessor.__members__, (f"{processor} is not a valid processor")
-        self.model_config = model_config
-        self.processor = ModelProcessor
+        assert (
+            processor in ModelProcessor.__members__
+        ), f"{processor} is not a valid processor"
+        self.processor = self.options.processor = ModelProcessor(processor)
         self.model = None
-        self.input_size = None
-        self.labels = None
-        self.confidence = None
-        self.device = None
         self._load_model()
 
     def _load_model(self):
         """Load the model"""
-        raise NotImplementedError
+        if not self.is_processor_available():
+            raise RuntimeError(
+                f"{self.processor} is not available on this system"
+            )
 
-    # def _preprocess(self, image: np.ndarray) -> np.ndarray:
-    #     """Preprocess the image"""
-    #     raise NotImplementedError
-    #
-    # def _postprocess(self, predictions: np.ndarray) -> List[Detection]:
-    #     """Postprocess the predictions"""
-    #     raise NotImplementedError
-    #
-    # def detect(self, image: np.ndarray) -> List[Detection]:
-    #     """Detect objects in the image"""
-    #     raise NotImplementedError
+        if self.model_source.framework == ModelFrameWork.OPENCV:
+            self.model = opencv.Detector(self.model_source, self.options)
+
+    def is_processor_available(self):
+        """Check if the processor is available"""
+        available = False
+        if self.processor == ModelProcessor.TPU:
+            if self.model_source.framework == ModelFrameWork.CORAL:
+                try:
+                    import pycoral
+                except ImportError:
+                    logger.warning(
+                        "pycoral not installed, cannot load any models that use the TPU processor"
+                    )
+                else:
+                    tpus = pycoral.utils.edgetpu.list_edge_tpus()
+                    if tpus:
+                        available = True
+                    else:
+                        logger.warning(
+                            "No TPU devices found, cannot load any models that use the TPU processor"
+                        )
+            else:
+                logger.warning(
+                    "TPU processor is only available for Coral models!"
+                )
+        elif self.processor == ModelProcessor.GPU:
+            if self.model_source.framework == ModelFrameWork.OPENCV:
+                try:
+                    import cv2.cuda
+                except ImportError:
+                    logger.warning(
+                        "OpenCV does not have CUDA enabled/compiled, cannot load any models that use the GPU processor"
+                    )
+                else:
+                    if not cv2.cuda.getCudaEnabledDeviceCount():
+                        logger.warning(
+                            "No CUDA devices found, cannot load any models that use the GPU processor"
+                        )
+                    else:
+                        available = True
+            elif self.model_source.framework == ModelFrameWork.TENSORFLOW:
+                try:
+                    import tensorflow as tf
+                except ImportError:
+                    logger.warning(
+                        "tensorflow not installed, cannot load any models that use tensorflow GPU processor"
+                    )
+                else:
+                    if not tf.config.list_physical_devices("GPU"):
+                        logger.warning(
+                            "No CUDA devices found, cannot load any models that use the GPU processor"
+                        )
+                    else:
+                        available = True
+            elif self.model_source.framework == ModelFrameWork.PYTORCH:
+                try:
+                    import torch
+                except ImportError:
+                    logger.warning(
+                        "pytorch not installed, cannot load any models that use pytorch GPU processor"
+                    )
+                else:
+                    if not torch.cuda.is_available():
+                        logger.warning(
+                            "No CUDA devices found, cannot load any models that use the GPU processor"
+                        )
+                    else:
+                        available = True
+            return available
+
+    def detect(self, image: np.ndarray):
+        """Detect objects in the image"""
+        assert self.model, "model not loaded"
+        return self.model.detect(image)
+
 
 class DetectionRequest(BaseModel):
     image: UploadFile = File(..., description="Image to run the ML model on")
