@@ -126,6 +126,8 @@ class AvailableModel(BaseModel):
     input: Path = Field(..., description="model file/dir path")
     enabled: bool = Field(True, description="model enabled")
     description: str = Field(None, description="model description")
+    framework: ModelFrameWork = Field(ModelFrameWork.OPENCV, description="model framework")
+    model_type: ModelType = Field(ModelType.OBJECT, description="model type (object, face, alpr)")
     classes: Path = Field(default=None, description="model labels file path (Optional)")
     config: Path = Field(default=None, description="model config file path (Optional)")
     labels: List[str] = Field(
@@ -138,6 +140,20 @@ class AvailableModel(BaseModel):
     default_config: DefaultConfig = Field(
         default_factory=DefaultConfig, description="Default Configuration for the model"
     )
+
+    @validator("framework", pre=True)
+    def framework_validator(cls, v):
+        if isinstance(v, str):
+            v = v.lower()
+            v = ModelFrameWork(v)
+        return v
+
+    @validator("model_type", pre=True)
+    def model_type_validator(cls, v):
+        if isinstance(v, str):
+            v = v.lower()
+            v = ModelType(v)
+        return v
 
     @validator("config", "input", "classes", pre=True, always=True)
     def str_to_path(cls, v, values, field: ModelField) -> Optional[Path]:
@@ -471,10 +487,18 @@ class GlobalConfig(BaseModel):
 
 
 class Detector:
-    """Base class for detectors"""
+    """Base class for detectors
+    Specify a processor type and then load the model into processor memory. run inferrence on the processor
+    """
 
-    def __init__(self, model_config: AvailableModel):
+    def __init__(self, model_config: AvailableModel, processor: Optional[str] = None):
+        if not processor:
+            processor = ModelProcessor.CPU
+        assert isinstance(processor, str), "processor must be a string"
+        processor = processor.lower().strip()
+        assert processor in ModelProcessor.__members__, (f"{processor} is not a valid processor")
         self.model_config = model_config
+        self.processor = ModelProcessor
         self.model = None
         self.input_size = None
         self.labels = None
@@ -486,17 +510,17 @@ class Detector:
         """Load the model"""
         raise NotImplementedError
 
-    def _preprocess(self, image: np.ndarray) -> np.ndarray:
-        """Preprocess the image"""
-        raise NotImplementedError
-
-    def _postprocess(self, predictions: np.ndarray) -> List[Detection]:
-        """Postprocess the predictions"""
-        raise NotImplementedError
-
-    def detect(self, image: np.ndarray) -> List[Detection]:
-        """Detect objects in the image"""
-        raise NotImplementedError
+    # def _preprocess(self, image: np.ndarray) -> np.ndarray:
+    #     """Preprocess the image"""
+    #     raise NotImplementedError
+    #
+    # def _postprocess(self, predictions: np.ndarray) -> List[Detection]:
+    #     """Postprocess the predictions"""
+    #     raise NotImplementedError
+    #
+    # def detect(self, image: np.ndarray) -> List[Detection]:
+    #     """Detect objects in the image"""
+    #     raise NotImplementedError
 
 class DetectionRequest(BaseModel):
     image: UploadFile = File(..., description="Image to run the ML model on")
