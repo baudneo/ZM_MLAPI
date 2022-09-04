@@ -1,20 +1,37 @@
 import logging
 import sys
 import time
+import uuid
 from functools import lru_cache
 from pathlib import Path
 from typing import Union
+from platform import python_version
 
 import cv2
 import numpy as np
 import pydantic
 import uvicorn
-from fastapi import FastAPI, HTTPException, File, UploadFile, Depends, __version__ as fastapi_version
+import sqlalchemy as sa
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    File,
+    UploadFile,
+    Depends,
+    __version__ as fastapi_version,
+)
 from fastapi.responses import RedirectResponse
 
-from zm_mlapi.schemas import Settings, ModelType, GlobalConfig
+from zm_mlapi.schemas import (
+    Settings,
+    ModelType,
+    GlobalConfig,
+    ModelProcessor,
+    ModelFrameWork, ModelSequence,
+)
+__db_driver__ = "mysql+pymysql://"
 
-
+# mysql+pymysql://<username>:<password>@<host>/<dbname>[?<options>]
 __version__ = "0.0.1"
 __version_type__ = "dev"
 
@@ -28,7 +45,6 @@ formatter = logging.Formatter(
 stream_handler = logging.StreamHandler(stream=sys.stdout)
 stream_handler.setFormatter(formatter)
 logger.addHandler(stream_handler)
-from platform import python_version
 
 logger.info(
     f"ZM_MLAPI: {__version__} (type: {__version_type__}) [Python: {python_version()} - OpenCV: {cv2.__version__} - Numpy: {np.__version__} - FastAPI: {fastapi_version} - Pydantic: {pydantic.VERSION}]"
@@ -47,6 +63,9 @@ async def read_settings(env_file):
     return Settings(_env_file=env_file)
 
 
+def get_global_config() -> GlobalConfig:
+    return g
+
 @app.get("/", response_class=RedirectResponse, include_in_schema=False)
 async def docs():
     return RedirectResponse(url="/docs")
@@ -60,20 +79,58 @@ async def available_models():
     return {"models": g.available_models}
 
 
-# upload an image for inference
-@app.post("/detect/{infer_type}", summary="Run detection on an image")
-async def object_detection(infer_type: ModelType, image: UploadFile = File(...)):
-    if infer_type == ModelType.OBJECT:
+@app.get("/available_models/{model_uuid}")
+async def available_model(model_uuid: str):
+    model_uuid = model_uuid.lower().strip()
+    if g.settings.model_dir is None:
+        raise HTTPException(status_code=404, detail="No models directory configured")
 
-        return {"message": "object detection", "image_name": image.filename}
-    elif infer_type == ModelType.FACE:
-        return {"message": "face detection", "image_name": image.filename}
-    elif infer_type == ModelType.ALPR:
-        return {"message": "alpr detection", "image_name": image.filename}
-    else:
-        raise HTTPException(
-            status_code=404, detail=f"Inference type ({infer_type}) not found"
-        )
+    if model_uuid not in g.available_models:
+        raise HTTPException(status_code=404, detail="Model not found")
+
+    return g.available_models[model_uuid]
+
+
+# upload an image for inference
+from fastapi import Path as FastPath, Query
+
+
+@app.post("models/create_sequence", description="Create a new model sequence")
+async def create_live_model(sequence: ModelSequence):
+    model_uuid = str(sequence.based_on).lower().strip()
+    if g.settings.model_dir is None:
+        raise HTTPException(status_code=404, detail="No models directory configured")
+
+    if model_uuid not in g.available_models:
+        raise HTTPException(status_code=404, detail="Available model UUID not found")
+
+    model = g.available_models[model_uuid]
+
+
+    return sequence
+
+
+
+@app.post("/detect/{model_uuid}", summary="Run detection on an image")
+async def object_detection(
+    model_uuid: str = FastPath(description="A valid model UUID"),
+    image: UploadFile = File(..., description="Image to run the ML model on"),
+    minimum_confidence: float = Query(
+        0.2,
+        le=1.0,
+        ge=0.0,
+        description="Minimum confidence to return a detection expressed as a float between 0.0 and 1.0",
+    ),
+    nms_threshold: float = Query(
+        0.4,
+        le=1.0,
+        ge=0.0,
+        description="Non Max Suppression (NMS) threshold to apply to the model results expressed as a float between 0.0 and 1.0",
+    ),
+):
+    model_uuid = model_uuid.lower().strip()
+    if model_uuid not in g.available_models:
+        raise HTTPException(status_code=404, detail="Model UUID not found")
 
 
 class MLAPI:
@@ -109,7 +166,9 @@ class MLAPI:
                 logger.info(f"debug mode enabled")
                 logger.setLevel(logging.DEBUG)
             logger.debug(f"{self.cached_settings = }")
-            self.available_models = g.available_models = self.cached_settings.parse_model_dir()
+            self.available_models = (
+                g.available_models
+            ) = self.cached_settings.parse_model_dir()
         else:
             raise FileNotFoundError(f"'{self.env_file.as_posix()}' does not exist")
 

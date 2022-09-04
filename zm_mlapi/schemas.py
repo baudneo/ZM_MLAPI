@@ -75,15 +75,21 @@ class ModelFrameWork(str, Enum):
     TF = TENSORFLOW
     PYTORCH = "pytorch"
     DEEPFACE = "deepface"
+    OPENALPR_CLOUD = "openalpr_cloud"
+    OPENALPR = "openalpr"
+    PLATERECOGNIZER = "platerecognizer"
+
 
 
 class ModelProcessor(str, Enum):
     CPU = "cpu"
     GPU = "gpu"
     TPU = "tpu"
+    CLOUD = "cloud"
     cpu = CPU
     gpu = GPU
     tpu = TPU
+    cloud = CLOUD
 
 
 class DetectionResult(BaseModel):
@@ -182,18 +188,35 @@ class AvailableModel(BaseModel):
         return v
 
 
-class ModelSequence(AvailableModel):
-    show_name: str = None
-    enabled: bool = True
-    framework: ModelFrameWork = ModelFrameWork.OPENCV
-    processor: ModelProcessor = ModelProcessor.CPU
-    # Parsed labels file
-    height: int = 416
-    width: int = 416
-    # Floating Point 16 target (OpenCV - GPU only)
-    fp_16: bool = False
-    square_image: bool = Field(False, description="square image by zero padding")
+class ModelSequence(BaseModel):
+    based_on: uuid.UUID = Field(..., description="UUID of the available model to base the sequence on")
+    _source_model_data: AvailableModel = Field(None, description="The source model", repr=False, exclude=True)
 
+    id: int = Field(..., description="Unique ID of the model sequence (duplicates will be overwritten)")
+    name: str = Field(None, description="Name that will be shown in the annotated frame")
+    enabled: bool = Field(True, description="Enable/Disable the model")
+    framework: ModelFrameWork = Field(ModelFrameWork.OPENCV, description="model framework")
+    processor: ModelProcessor = Field(ModelProcessor.CPU, description="Processor used for this model")
+    # Model input size (image will be resized if needed)
+    height: int = Field(416, description="model input height (resized before inference)")
+    width: int = Field(416, description="model input width (resized before inference)")
+    fp_16: bool = Field(False, description="Floating Point 16 target (OpenCV - CUDA/cuDNN[GPU] only)")
+    square_image: bool = Field(False, description="square image by zero padding (if needed)")
+
+
+    @validator("based_on", always=True, pre=True)
+    def _validate_based_on(cls, v, values, field: ModelField) -> Optional[AvailableModel]:
+        from zm_mlapi.app import get_global_config
+        g = get_global_config()
+        logger.debug(f"validating {field.name} - {v = } -- {type(v) = } -- {values = }")
+        if not v:
+            raise ValueError(f"{field.name} is required")
+        if not isinstance(v, uuid.UUID):
+            raise ValueError(f"{field.name} must be a UUID")
+        if not (model := g.available_models.get(v)):
+            raise ValueError(f"{field.name} must be a valid UUID of an existing model")
+        values["_source_model_data"] = model
+        return v
     @validator("fp_16")
     def check_fp_16(cls, v, values):
         if (
@@ -221,9 +244,6 @@ class Settings(BaseSettings):
     log_dir: Union[str, Path] = Field(
         default=f"{data_dir}/logs", description="Logs directory"
     )
-    db_dir: Union[str, Path] = Field(
-        default=f"{data_dir}/db", description="User database directory"
-    )
     host: str = Field(default="0.0.0.0", description="Interface IP to listen on")
     port: int = Field(default=5000, description="Port to listen on")
     jwt_secret: str = Field(default="CHANGE ME", description="JWT signing key")
@@ -232,6 +252,13 @@ class Settings(BaseSettings):
         default=False, description="Uvicorn reload - For development only"
     )
     debug: bool = Field(default=False, description="Debug mode - For development only")
+
+    db_driver: str = Field("mysql+pymysql", description="Database driver (Default: mysql+pymysql)")
+
+    db_user: str = Field("zmuser", description="Database user (Default: zmuser)")
+    db_pass: str = Field("zmpass", description="Database user password (Default: zmpass)")
+    db_host: str = Field("localhost", description="Database host (Default: localhost)")
+    db_name: str = Field("zmai", description="Database name (Default: zmai)")
 
     @validator("data_dir", "model_dir", "log_dir", "db_dir", pre=True, always=True)
     def create_dirs(cls, v, values, field, **kwargs):
@@ -243,18 +270,18 @@ class Settings(BaseSettings):
             logger.debug(f"{field.name} directory: {v} exists")
         return v
 
-    def parse_model_dir(self) -> List[Optional[AvailableModel]]:
+    def parse_model_dir(self) -> Dict[str, Optional[AvailableModel]]:
         """Parse the model directory to get the available models"""
         import glob
 
-        available_models = []
+        available_models = {}
         if self.model_dir.is_dir():
             all_files = glob.glob(self.model_dir.as_posix() + "/*")
             for _dir in all_files:
                 if Path(_dir).is_dir():
                     model = self._parse_model(_dir)
                     if model:
-                        available_models.extend(model)
+                        available_models.update(model)
         else:
             logger.warning(f"{self.model_dir} is not a directory")
         logger.debug(
@@ -262,9 +289,10 @@ class Settings(BaseSettings):
         )
         return available_models
 
-    def _parse_model(self, model_dir: str) -> Optional[List[AvailableModel]]:
+    def _parse_model(self, model_dir: str) -> Optional[Dict[str, AvailableModel]]:
         """Parse a model directory to get the available model"""
-        available_models = []
+        lp: str = "model config:"
+        available_models = {}
         model_dir = Path(model_dir)
         if model_dir.exists():
             if model_dir.is_dir():
@@ -276,10 +304,10 @@ class Settings(BaseSettings):
 
                             model_config = json.load(f)
                         logger.debug(
-                            f"{model_config_file} -> {model_config} - {len(model_config) = }"
+                            f"{lp} {model_config_file} -> {model_config} - {len(model_config) = }"
                         )
                         for model_name, model_cfg in model_config.items():
-                            logger.debug(f"{type(model_cfg) = } -- {model_cfg = }")
+                            logger.debug(f"{lp} {type(model_cfg) = } -- {model_cfg = }")
                             model_cfg["name"] = model_name
                             model_cfg["input_file"] = (
                                 model_dir / model_cfg["input_file"]
@@ -293,44 +321,29 @@ class Settings(BaseSettings):
                                 else None
                             )
                             model = AvailableModel(**model_cfg)
-                            available_models.append(model)
+                            available_models[str(model.id)] = model
                         return available_models
                     else:
                         logger.warning(
-                            f"{model_config_file} is not a file, skipping..."
+                            f"{lp} {model_config_file} is not a file, skipping..."
                         )
                 else:
-                    logger.warning(f"{model_config_file} does not exist, skipping...")
+                    logger.warning(f"{lp} {model_config_file} does not exist, skipping...")
             else:
-                logger.warning(f"{model_dir} is not a directory, skipping...")
+                logger.warning(f"{lp} {model_dir} is not a directory, skipping...")
         else:
-            logger.warning(f"{model_dir} does not exist, skipping...")
+            logger.warning(f"{lp} {model_dir} does not exist, skipping...")
         return None
 
 
-class Detector:
-    type: ModelType = ModelType.OBJECT
-    sequence: List[AvailableModel] = []
-
-    def __init__(self, settings: Settings):
-        self.settings = settings
-        self.sequence = []
-        self.load_sequence()
-
-    def load_sequence(self):
-        pass
-
-
 class GlobalConfig(BaseModel):
-    available_models: List[AvailableModel] = Field(
-        default_factory=list, description="Available models, call by ID"
+    available_models: Dict[str, AvailableModel] = Field(
+        default_factory=dict, description="Available models, call by ID"
     )
     settings: Settings = Field(
         default=None, description="Global settings from ENVIRONMENT"
     )
-    detectors: List[Detector] = Field(
-        default=None, description="List of detectors to use"
-    )
+
 
     class Config:
         arbitrary_types_allowed = True
