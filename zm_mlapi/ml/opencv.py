@@ -95,7 +95,7 @@ class Detector:
                 self.options.processor = ModelProcessor.CPU
             else:  # Passed opencv version check, using GPU
                 self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
-                if self.config.fp_16:
+                if self.options.fp_16:
                     self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA_FP16)
                     logger.debug(
                         f"{LP} half precision floating point (FP16) cuDNN target enabled (turn this off if it"

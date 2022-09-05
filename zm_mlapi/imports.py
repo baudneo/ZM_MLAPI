@@ -6,6 +6,6 @@ from zm_mlapi.schemas import (
     AvailableModel,
     Settings,
     GlobalConfig,
-    DetectionRequest
+    APIDetector
 )
 

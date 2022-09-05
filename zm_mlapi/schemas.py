@@ -110,6 +110,7 @@ class ModelThresholds(BaseModel):
 
 
 class ModelOptions(BaseModel):
+    processor: ModelProcessor = Field(None, description="Processor to use for model")
     height: int = Field(
         416, ge=1, description="Height of the input image (resized for model)"
     )
@@ -117,10 +118,11 @@ class ModelOptions(BaseModel):
         416, ge=1, description="Width of the input image (resized for model)"
     )
     square: bool = Field(False, description="Zero pad the image to be a square")
+    fp_16: bool = Field(False, description="model uses Floating Point 16 Backend (EXPERIMENTAL!)")
+
     thresholds: ModelThresholds = Field(
         default_factory=ModelThresholds, description="Thresholds for the model"
     )
-    processor: ModelProcessor = Field(None, description="Processor to use for model")
 
 
 class AvailableModel(BaseModel):
@@ -143,9 +145,8 @@ class AvailableModel(BaseModel):
         repr=False,
         exclude=True,
     )
-    fp_16: bool = Field(False, description="model uses Floating Point 16 Backend (EXPERIMENTAL!)")
 
-    default_config: ModelOptions = Field(
+    detection_options: ModelOptions = Field(
         default_factory=ModelOptions, description="Default Configuration for the model"
     )
 
@@ -466,57 +467,32 @@ class Settings(BaseSettings):
             assert v.is_dir(), "log_dir is not a directory"
         return v
 
-    def parse_model_config(self):
-        """Parse the model configuration YAML file"""
-        logger.debug(f"parsing model config: {self.model_config}")
-        self.models = ModelOptions(self.model_config)
 
-
-class GlobalConfig(BaseModel):
-    available_models: Dict[str, AvailableModel] = Field(
-        default_factory=dict, description="Available models, call by ID"
-    )
-    settings: Settings = Field(
-        default=None, description="Global settings from ENVIRONMENT"
-    )
-
-    detectors
-
-    class Config:
-        arbitrary_types_allowed = True
-
-
-class Detector:
+class APIDetector:
     """Base class for detectors
-    Specify a processor type and then load the model into processor memory. run inferrence on the processor
+    Specify a processor type and then load the model into processor memory. run an inference on the processor
     """
 
-    model_source: AvailableModel
-    processor: ModelProcessor
-    options: ModelOptions
+    model_config: AvailableModel
+    model_options: ModelOptions
+    model_processor: ModelProcessor
 
     def __init__(
         self,
         model: AvailableModel,
-        processor: Optional[str] = None,
         options: Optional[ModelOptions] = None,
     ):
-        self.options = options
-        self.model_source = model
-        if not processor:
+        self.model_options = options
+        self.model_config = model
+        if not self.model_options.processor:
             if model.framework == ModelFrameWork.CORAL:
-                processor = "tpu"
+                self.model_options.processor = ModelProcessor.TPU
             else:
-                processor = "cpu"
+                self.model_options.processor = ModelProcessor.CPU
             logger.debug(
-                f"no processor specified, using {model.framework} default: {processor}"
+                f"no processor specified, using {model.framework} default: {self.model_options.processor}"
             )
-        assert isinstance(processor, str), "processor must be a string"
-        processor = processor.lower().strip()
-        assert (
-            processor in ModelProcessor.__members__
-        ), f"{processor} is not a valid processor"
-        self.processor = self.options.processor = ModelProcessor(processor)
+        self.model_processor = self.model_options.processor
         self.model = None
         self._load_model()
 
@@ -524,18 +500,24 @@ class Detector:
         """Load the model"""
         if not self.is_processor_available():
             raise RuntimeError(
-                f"{self.processor} is not available on this system"
+                f"{self.model_processor} is not available on this system"
             )
 
-        if self.model_source.framework == ModelFrameWork.OPENCV:
+        if self.model_config.framework == ModelFrameWork.OPENCV:
             from zm_mlapi.ml.opencv import Detector as OpenCVDetector
-            self.model = OpenCVDetector(self.model_source, self.options)
+            self.model = OpenCVDetector(self.model_config, self.model_options)
+
+    def set_model_options(self, options: ModelOptions):
+        if options != self.model_options:
+            self.model_options = options
+            self._load_model()
+        self.model_options = options
 
     def is_processor_available(self):
         """Check if the processor is available"""
         available = False
-        if self.processor == ModelProcessor.TPU:
-            if self.model_source.framework == ModelFrameWork.CORAL:
+        if self.model_processor == ModelProcessor.TPU:
+            if self.model_config.framework == ModelFrameWork.CORAL:
                 try:
                     import pycoral
                 except ImportError:
@@ -554,8 +536,8 @@ class Detector:
                 logger.warning(
                     "TPU processor is only available for Coral models!"
                 )
-        elif self.processor == ModelProcessor.GPU:
-            if self.model_source.framework == ModelFrameWork.OPENCV:
+        elif self.model_processor == ModelProcessor.GPU:
+            if self.model_config.framework == ModelFrameWork.OPENCV:
                 try:
                     import cv2.cuda
                 except ImportError:
@@ -569,7 +551,7 @@ class Detector:
                         )
                     else:
                         available = True
-            elif self.model_source.framework == ModelFrameWork.TENSORFLOW:
+            elif self.model_config.framework == ModelFrameWork.TENSORFLOW:
                 try:
                     import tensorflow as tf
                 except ImportError:
@@ -583,7 +565,7 @@ class Detector:
                         )
                     else:
                         available = True
-            elif self.model_source.framework == ModelFrameWork.PYTORCH:
+            elif self.model_config.framework == ModelFrameWork.PYTORCH:
                 try:
                     import torch
                 except ImportError:
@@ -597,7 +579,7 @@ class Detector:
                         )
                     else:
                         available = True
-            return available
+        return available
 
     def detect(self, image: np.ndarray):
         """Detect objects in the image"""
@@ -605,7 +587,15 @@ class Detector:
         return self.model.detect(image)
 
 
-class DetectionRequest(ModelOptions):
-    # image: UploadFile = File(..., description="Image to run the ML model on")
-    processor: ModelProcessor = Field(..., description="Processor to use")
+class GlobalConfig(BaseModel):
+    available_models: Dict[str, AvailableModel] = Field(
+        default_factory=dict, description="Available models, call by ID"
+    )
+    settings: Settings = Field(
+        default=None, description="Global settings from ENVIRONMENT"
+    )
 
+    detectors: List[APIDetector] = Field(default_factory=list, description="Loaded detectors")
+
+    class Config:
+        arbitrary_types_allowed = True

@@ -4,7 +4,7 @@ import time
 from functools import lru_cache
 from pathlib import Path
 from platform import python_version
-from typing import Union
+from typing import Union, Optional
 
 import cv2
 import numpy as np
@@ -17,15 +17,13 @@ from fastapi import (
     UploadFile,
     __version__ as fastapi_version,
     Path as PathParam,
-    Query as QueryParam, Body,
+    Query as QueryParam,
+    Body,
+    Form,
 )
 from fastapi.responses import RedirectResponse
 
-from zm_mlapi.imports import (
-    Settings,
-    GlobalConfig,
-    DetectionRequest
-)
+from zm_mlapi.imports import Settings, GlobalConfig, ModelOptions, APIDetector
 
 __db_driver__ = "mysql+pymysql://"
 
@@ -64,6 +62,7 @@ async def read_settings(env_file):
 def get_global_config() -> GlobalConfig:
     return g
 
+
 @app.get("/", response_class=RedirectResponse, include_in_schema=False)
 async def docs():
     return RedirectResponse(url="/docs")
@@ -71,23 +70,51 @@ async def docs():
 
 @app.get("/available_models")
 async def available_models():
-    return {"models": g.available_models}
+    return {"models": get_global_config().available_models}
 
 
 # upload an image for inference
 @app.post("/detect/{model_uuid}", summary="Run detection on an image")
 async def object_detection(
-    model_uuid: str = PathParam(description="A valid model UUID"),
+    model_uuid: str,
+    model_options: ModelOptions = Form(),
     image: UploadFile = File(..., description="Image to run the ML model on"),
-    model_options: DetectionRequest = Body(...)
 ):
+    logger.info(f"Running detection on image '{image.filename}'")
     model_uuid = model_uuid.lower().strip()
     if model_uuid not in g.available_models:
         raise HTTPException(status_code=404, detail="Model UUID not found")
     # Check if a detector is already configured using the MODEL and PROCESSOR type, if so, use it with
     # the new image and options
     # If not, create a new detector and use it
+
     detectors = get_global_config().detectors
+    detector: Optional[APIDetector] = None
+    # check if a detector already exists for this model and processor
+    for detector in detectors:
+        if (
+            detector.model_config.id == model_uuid
+            and detector.model_options.processor == model_options.processor
+        ):
+            logger.info(f"Using existing detector for model {model_uuid} -> {detector}")
+            detector.set_model_options(model_options)
+            break
+    else:
+        # create a new detector and append to the list
+        model = g.available_models[model_uuid]
+        detector = APIDetector(model, model_options)
+        detectors.append(detector)
+        logger.info(f"Created new detector for model {model_uuid} -> {detector}")
+    # now we have a detector, use it
+    frame = load_image_into_numpy_array(await image.read())
+    return await detector.detect(frame)
+
+
+def load_image_into_numpy_array(data):
+    npimg = np.frombuffer(data, np.uint8)
+    # frame = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
+    # cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    return npimg
 
 
 class MLAPI:
@@ -137,11 +164,60 @@ class MLAPI:
 
     def start_server(self):
         logger.info("running server")
+        uvicorn_log_config = {
+            "version": 1,
+            "disable_existing_loggers": True,
+            "formatters": {
+                "default": {
+                    "()": "uvicorn.logging.DefaultFormatter",
+                    "fmt": "%(asctime)s.%(msecs)04d %(name)s[%(process)s] %(levelname)s %(module)s:%(lineno)d->[%(message)s]",
+                    "use_colors": None,
+                },
+                "access": {
+                    "()": "uvicorn.logging.AccessFormatter",
+                    "fmt": '%(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s',
+                },
+            },
+            "handlers": {
+                "default": {
+                    "formatter": "default",
+                    "class": "logging.StreamHandler",
+                    "stream": "ext://sys.stderr",
+                },
+                "access": {
+                    "formatter": "access",
+                    "class": "logging.StreamHandler",
+                    "stream": "ext://sys.stdout",
+                },
+            },
+            "loggers": {
+                "uvicorn": {"handlers": ["default"], "level": "DEBUG"},
+                "uvicorn.error": {
+                    "level": "DEBUG",
+                    "handlers": ["default"],
+                    "propagate": True,
+                },
+                "uvicorn.access": {
+                    "handlers": ["access"],
+                    "level": "DEBUG",
+                    "propagate": False,
+                },
+                "zm_mlapi": {
+                    "handlers": ["default"],
+                    "level": "DEBUG"
+                },
+            },
+        }
+        log_config = uvicorn.config.LOGGING_CONFIG
+        uvicorn.LOGGING_CONFIG = uvicorn_log_config
         config = uvicorn.Config(
             "zm_mlapi.app:app",
             host=self.cached_settings.host,
             port=self.cached_settings.port,
             reload=self.cached_settings.reload,
+            debug=self.cached_settings.debug,
+            log_config=uvicorn_log_config,
+            log_level="debug",
         )
         lifetime = time.perf_counter()
         self.server = uvicorn.Server(config)
