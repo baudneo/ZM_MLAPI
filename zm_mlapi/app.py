@@ -5,7 +5,7 @@ import time
 from functools import lru_cache
 from pathlib import Path
 from platform import python_version
-from typing import Union, Optional, Type, Tuple, List, Dict
+from typing import Union, Optional, Type, Dict
 
 import cv2
 import numpy as np
@@ -32,7 +32,6 @@ from zm_mlapi.imports import (
     DetectionResult,
 )
 
-# mysql+pymysql://<username>:<password>@<host>/<dbname>[?<options>]
 __version__ = "0.0.1"
 __version_type__ = "dev"
 
@@ -42,7 +41,6 @@ formatter = logging.Formatter(
     "%(asctime)s.%(msecs)04d %(name)s[%(process)s] %(levelname)s %(module)s:%(lineno)d -> %(message)s",
     "%m/%d/%y %H:%M:%S",
 )
-# 08/28/22 11:17:10.794009 zm_mlapi[170] DBG1 pyzm_utils:1567->
 stream_handler = logging.StreamHandler(stream=sys.stdout)
 stream_handler.setFormatter(formatter)
 logger.addHandler(stream_handler)
@@ -57,7 +55,7 @@ app = FastAPI()
 g = GlobalConfig()
 
 
-# Allow Form() to contain JSON, Nested JSON is not allowed though
+# Allow Form() to contain JSON, Nested JSON is not allowed though - Transforms into Query()
 def as_form(cls: Type[BaseModel]):
     new_parameters = []
 
@@ -85,15 +83,6 @@ def as_form(cls: Type[BaseModel]):
     return cls
 
 
-@lru_cache()
-async def read_cached_settings(env_file):
-    return Settings(_env_file=env_file)
-
-
-async def read_settings(env_file):
-    return Settings(_env_file=env_file)
-
-
 def get_global_config() -> GlobalConfig:
     return g
 
@@ -119,7 +108,6 @@ async def object_detection(
     model_options: ModelOptions = Depends(),
     image: UploadFile = File(..., description="Image to run the ML model on"),
 ):
-    logger.info(f"Running detection on image '{image.filename}'")
     model_uuid = model_uuid.lower().strip()
     model: Optional[AvailableModel] = None
     for _model in g.available_models:

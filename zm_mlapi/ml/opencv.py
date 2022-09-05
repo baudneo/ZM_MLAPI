@@ -2,10 +2,10 @@ import time
 from logging import getLogger
 from typing import Optional
 
-# Constants
+
 from zm_mlapi.imports import ModelProcessor, ModelOptions, AvailableModel
 
-LP: str = "DNN:"
+LP: str = "OpenCV DNN:"
 logger = getLogger("zm_mlapi")
 
 try:
@@ -20,9 +20,7 @@ except ImportError as e:
     raise e
 
 
-# cv2 version check for unconnected layers fix
 def cv2_version() -> int:
-    # Sick and tired of OpenCV playing games....
     _maj, _min, _patch = "", "", ""
     x = cv2.__version__.split(".")
     x_len = len(x)
@@ -46,14 +44,14 @@ class Detector:
         self.options: ModelOptions = model_options
         self.processor: ModelProcessor = self.options.processor
         self.model_name = self.config.name
+        self.net: Optional[cv2.dnn] = None
+        self.model: Optional[cv2.dnn.DetectionModel] = None
         logger.info(f"{LP} initializing...")
 
         logger.debug(f"{LP} configuration: {self.config}")
         logger.debug(f"{LP} options: {self.options}")
 
-        self.original_image: Optional[np.ndarray] = None
-        self.net: Optional[cv2.dnn] = None
-        self.model: Optional[cv2.dnn.DetectionModel] = None
+
 
     @property
     def options(self):
@@ -71,18 +69,24 @@ class Detector:
         return self.config.labels
 
     def load_model(self):
-        logger.debug(f"{LP} loading data from named model: {self.model_name}")
+        logger.debug(f"{LP} loading model into processor memory: {self.model_name} ({self.config.id})")
         load_timer = time.perf_counter()
         try:
-            self.net = cv2.dnn.readNet(
-                self.config.input.as_posix(), self.config.config.as_posix()
-            )
+            # Allow for .weights/.cfg and .onnx YOLO architectures
+            model_file: str = self.config.input.as_posix()
+            config_file: Optional[str] = None
+            if self.config.config and self.config.config.exists():
+                config_file = self.config.config.as_posix()
+            self.net = cv2.dnn.readNet(model_file, config_file)
         except Exception as model_load_exc:
             logger.error(
                 f"{LP} Error while loading model file and/or config! "
                 f"(May need to re-download the model/cfg file) => {model_load_exc}"
             )
-            raise ValueError(repr(model_load_exc))
+            raise model_load_exc
+        # DetectionModel allows to set params for preprocessing input image. DetectionModel creates net
+        # from file with trained weights and config, sets preprocessing input, runs forward pass and return
+        # result detections. For DetectionModel SSD, Faster R-CNN, YOLO topologies are supported.
         self.model = cv2.dnn.DetectionModel(self.net)
         self.model.setInputParams(
             scale=1 / 255, size=(self.options.width, self.options.height), swapRB=True
@@ -102,7 +106,7 @@ class Detector:
                     self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA_FP16)
                     logger.debug(
                         f"{LP} half precision floating point (FP16) cuDNN target enabled (turn this off if it"
-                        f" makes yolo slower or you see NaN errors!)"
+                        f" makes detections slower or you see 'NaN' errors!)"
                     )
                 else:
                     self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
@@ -112,7 +116,7 @@ class Detector:
             f"{', set CUDA/cuDNN backend and target' if self.options.processor == ModelProcessor.GPU else ''}"
         )
         logger.debug(
-            f"perf:{LP} loading of DetectionModel completed in {time.perf_counter() - load_timer:.5f}ms"
+            f"perf:{LP} loading completed in {time.perf_counter() - load_timer:.5f}ms"
         )
 
     @staticmethod
@@ -129,35 +133,30 @@ class Detector:
 
     def detect(self, input_image: Optional[np.ndarray] = None, retry: bool = False):
         if input_image is None:
-            logger.error(f"{LP} no image passed!?!")
             raise ValueError("NO_IMAGE")
-        blob, outs = None, None
-        class_ids, confidences, boxes = [], [], []
-        bbox, label, conf = [], [], []
-        h, w = input_image.shape[:2]
-        nms_threshold, conf_threshold = self.options.nms, self.options.confidence
-        logger.debug(
-            f"{LP} confidence threshold: {conf_threshold} -- NMS threshold: {nms_threshold}"
-        )
         if self.options.square:
             input_image = self.square_image(input_image)
-            h, w = input_image.shape[:2]
+        class_ids, confidences, boxes = [], [], []
+        bboxs, labels, confs = [], [], []
+        h, w = input_image.shape[:2]
+        nms_threshold, conf_threshold = self.options.nms, self.options.confidence
         try:
             if not self.net or (self.net and retry):
                 # model has not been loaded or this is a retry detection, so we want to rebuild
                 # the model with changed options.
-                logger.debug(
-                    f"DEBUGGING - self.net? {'yes' if self.net else 'no'} -- {retry = } ---<> LOADING MODEL"
-                )
                 self.load_model()
             logger.debug(
-                f"{LP} '{self.model_name}' ({self.options.processor.value}) - input image {w}*{h} - "
+                f"{LP} '{self.model_name}' ({self.options.processor}) - input image {w}*{h} - "
                 f"model input set as: {self.options.width}*{self.options.height}"
             )
-            t = time.perf_counter()
+            detection_timer = time.perf_counter()
 
             class_ids, confidences, boxes = self.model.detect(
                 input_image, conf_threshold, nms_threshold
+            )
+            logger.debug(
+                f"perf:{LP}{self.options.processor}: '{self.model_name}' detection "
+                f"took: {time.perf_counter() - detection_timer:.5f}ms"
             )
             for (class_id, confidence, box) in zip(class_ids, confidences, boxes):
                 confidence = float(confidence)
@@ -168,7 +167,7 @@ class Detector:
                         int(round(box[2])),
                         int(round(box[3])),
                     )
-                    bbox.append(
+                    bboxs.append(
                         [
                             x,
                             y,
@@ -176,8 +175,8 @@ class Detector:
                             y + _h,
                         ]
                     )
-                    label.append(self.config.labels[class_id])
-                    conf.append(confidence)
+                    labels.append(self.config.labels[class_id])
+                    confs.append(confidence)
         except Exception as all_ex:
             err_msg = repr(all_ex)
             # cv2.error: OpenCV(4.2.0) /home/<Someone>/opencv/modules/dnn/src/cuda/execution.hpp:52: error: (-217:Gpu
@@ -202,18 +201,15 @@ class Detector:
                 )
                 self.detect(input_image, retry=True)
             raise Exception(f"during detection -> {all_ex}")
-        diff_time = time.perf_counter() - t
-        logger.debug(
-            f"perf:{LP}{self.options.processor}: '{self.config.name}' detection took: {diff_time}",
-        )
-        _model_name = [f"{self.model_name}[{self.options.processor}]"] * len(label)
-        if not label:
+
+        if not labels:
             logger.debug(f"{LP} no detections to return!")
         return {
+            "detections": True if labels else False,
             "type": self.config.model_type,
             "processor": self.options.processor,
-            "model_name": self.config.name,
-            "label": label,
-            "confidence": conf,
-            "bounding_box": bbox,
+            "model_name": self.model_name,
+            "label": labels,
+            "confidence": confs,
+            "bounding_box": bboxs,
         }

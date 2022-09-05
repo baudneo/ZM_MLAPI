@@ -1,11 +1,12 @@
 import logging
 import uuid
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Union, List, Dict, Optional, IO
 
 import numpy as np
-from fastapi import UploadFile, File
+from fastapi import UploadFile, File, Form
 from pydantic import BaseModel, Field, validator, BaseSettings
 from pydantic.fields import ModelField
 
@@ -105,23 +106,33 @@ class DetectionResult(BaseModel):
 
 
 class ModelOptions(BaseModel):
-    processor: ModelProcessor = Field(ModelProcessor.CPU, description="Processor to use for model")
-    height: int = Field(
+    processor: Optional[ModelProcessor] = Field(
+        ModelProcessor.CPU, description="Processor to use for model"
+    )
+    height: Optional[int] = Field(
         416, ge=1, description="Height of the input image (resized for model)"
     )
-    width: int = Field(
+    width: Optional[int] = Field(
         416, ge=1, description="Width of the input image (resized for model)"
     )
-    square: bool = Field(False, description="Zero pad the image to be a square")
-    fp_16: bool = Field(False, description="model uses Floating Point 16 Backend (EXPERIMENTAL!)")
-    confidence: float = Field(0.5, ge=0.0, le=1.0, descritpiton="Confidence Threshold")
-    nms: float = Field(
+    square: Optional[bool] = Field(
+        False, description="Zero pad the image to be a square"
+    )
+    fp_16: Optional[bool] = Field(
+        False, description="model uses Floating Point 16 Backend (EXPERIMENTAL!)"
+    )
+    confidence: Optional[float] = Field(
+        0.5, ge=0.0, le=1.0, descritpiton="Confidence Threshold"
+    )
+    nms: Optional[float] = Field(
         0.4, ge=0.0, le=1.0, description="Non-Maximum Suppression Threshold"
     )
 
 
 class AvailableModel(BaseModel):
-    id: uuid.UUID = Field(default_factory=uuid.uuid4, description="Unique ID of the model")
+    id: uuid.UUID = Field(
+        default_factory=uuid.uuid4, description="Unique ID of the model"
+    )
     name: str = Field(..., description="model name")
     input: Path = Field(..., description="model file/dir path")
     enabled: bool = Field(True, description="model enabled")
@@ -408,7 +419,6 @@ class Settings(BaseSettings):
     models: ModelConfig = Field(None, description="ModelConfig object", exclude=True)
     available_models: List[AvailableModel] = Field(None, description="Available models")
 
-
     # def __init__(self, args, **kwargs):
     #     logger.info(f"Settings: {args = } -- {kwargs = }")
     #     print(f"Settings: {args = } -- {kwargs = }")
@@ -439,7 +449,6 @@ class Settings(BaseSettings):
         logger.debug(f"parsing model config: {model_config}")
         v = ModelConfig(model_config)
         return v
-
 
     @validator("model_config", "log_dir", pre=True, always=True)
     def _validate_path(cls, v, values, field: ModelField) -> Optional[Path]:
@@ -474,6 +483,7 @@ class APIDetector:
 
     def __repr__(self):
         return f"{self.__class__.__name__}({self.model_config}) Options: {self.model_options}"
+
     def __init__(
         self,
         model: AvailableModel,
@@ -502,6 +512,7 @@ class APIDetector:
 
         if self.model_config.framework == ModelFrameWork.OPENCV:
             from zm_mlapi.ml.opencv import Detector as OpenCVDetector
+
             self.model = OpenCVDetector(self.model_config, self.model_options)
 
     def set_model_options(self, options: ModelOptions):
@@ -532,9 +543,7 @@ class APIDetector:
                             "No TPU devices found, cannot load any models that use the TPU processor"
                         )
             else:
-                logger.warning(
-                    "TPU processor is only available for Coral models!"
-                )
+                logger.warning("TPU processor is only available for Coral models!")
         elif self.model_processor == ModelProcessor.GPU:
             if self.model_config.framework == ModelFrameWork.OPENCV:
                 try:
@@ -594,7 +603,9 @@ class GlobalConfig(BaseModel):
         default=None, description="Global settings from ENVIRONMENT"
     )
 
-    detectors: List[APIDetector] = Field(default_factory=list, description="Loaded detectors")
+    detectors: List[APIDetector] = Field(
+        default_factory=list, description="Loaded detectors"
+    )
 
     class Config:
         arbitrary_types_allowed = True
