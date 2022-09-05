@@ -1,15 +1,14 @@
+import logging
 import uuid
 from enum import Enum
-import logging
 from pathlib import Path
 from typing import Union, List, Dict, Optional, IO
 
 import numpy as np
-from fastapi import UploadFile, File, Query
+from fastapi import UploadFile, File
 from pydantic import BaseModel, Field, validator, BaseSettings
 from pydantic.fields import ModelField
 
-from zm_mlapi.ml import opencv, face, alpr
 
 logger = logging.getLogger("zm_mlapi")
 
@@ -144,6 +143,7 @@ class AvailableModel(BaseModel):
         repr=False,
         exclude=True,
     )
+    fp_16: bool = Field(False, description="model uses Floating Point 16 Backend (EXPERIMENTAL!)")
 
     default_config: ModelOptions = Field(
         default_factory=ModelOptions, description="Default Configuration for the model"
@@ -165,20 +165,22 @@ class AvailableModel(BaseModel):
 
     @validator("config", "input", "classes", pre=True, always=True)
     def str_to_path(cls, v, values, field: ModelField) -> Optional[Path]:
-        logger.debug(f"validating {field.name} - {v = } -- {type(v) = } -- {values = }")
+        # logger.debug(f"validating {field.name} - {v = } -- {type(v) = } -- {values = }")
         msg = f"{field.name} must be a path or a string of a path"
+        model_name = values.get("name", "Unknown Model")
+        lp = f"Model Name: {model_name} ->"
 
         if v is None:
             if field.name == "input":
                 raise ValueError(f"{msg}, not 'None'")
-            logger.debug(f"{field.name} is None, passing as it is Optional")
+            logger.debug(f"{lp} {field.name} is None, passing as it is Optional")
             return v
         elif not isinstance(v, (Path, str)):
             raise ValueError(msg)
         elif isinstance(v, str):
-            logger.debug(
-                f"Attempting to convert {field.name} string '{v}' to Path object"
-            )
+            # logger.debug(
+            #     f"Attempting to convert {field.name} string '{v}' to Path object"
+            # )
             v = Path(v)
         if field.name == "config":
             if values["input"].suffix == ".weights":
@@ -189,18 +191,20 @@ class AvailableModel(BaseModel):
         assert v.exists(), f"{msg}, it does not exist"
         assert v.is_file(), f"{msg}, it is not a file"
         assert isinstance(v, Path), f"{field.name} is not a Path object"
-        logger.debug(
-            f"DBG>>> {field.name} is a validated Path object -> RETURNING {type(v) = } --> {v = }"
-        )
+        # logger.debug(
+        #     f"DBG>>> {field.name} is a validated Path object -> RETURNING {type(v) = } --> {v = }"
+        # )
         return v
 
     @validator("labels", always=True)
     def _validate_labels(cls, v, values, field: ModelField) -> Optional[List[str]]:
-        logger.debug(f"validating {field.name} - {v = } -- {type(v) = } -- {values = }")
+        # logger.debug(f"validating {field.name} - {v = } -- {type(v) = } -- {values = }")
+        model_name = values.get("name", "Unknown Model")
+        lp = f"Model Name: {model_name} ->"
         if not v:
             if not (labels_file := values["classes"]):
                 logger.debug(
-                    f"'classes' is not defined. Using *default* COCO 2017 class labels"
+                    f"{lp} 'classes' is not defined. Using *default* COCO 2017 class labels"
                 )
                 from zm_mlapi.ml.coco_2017 import COCO_NAMES
 
@@ -405,25 +409,14 @@ class Settings(BaseSettings):
     )
     debug: bool = Field(default=False, description="Debug mode - For development only")
 
-    db_driver: str = Field(
-        "mysql+pymysql", description="Database driver (Default: mysql+pymysql)"
-    )
-
-    db_user: str = Field("zmuser", description="Database user (Default: zmuser)")
-    db_pass: str = Field(
-        "zmpass", description="Database user password (Default: zmpass)"
-    )
-    db_host: str = Field("localhost", description="Database host (Default: localhost)")
-    db_port: int = Field(3306, description="Database port (Default: 3306)")
-    db_name: str = Field("zmai", description="Database name (Default: zmai)")
-    db_options: str = Field(None, description="Database options (Default: None)")
-    # mysql+pymysql://<username>:<password>@<host>/<dbname>[?<options>]
-    db_connection_string: str = Field(
-        None, description="SQLAlchemy database connection string (Default: None)"
-    )
-
     models: ModelConfig = Field(None, description="ModelConfig object", exclude=True)
     available_models: List[AvailableModel] = Field(None, description="Available models")
+
+
+    # def __init__(self, args, **kwargs):
+    #     logger.info(f"Settings: {args = } -- {kwargs = }")
+    #     print(f"Settings: {args = } -- {kwargs = }")
+    #     super().__init__(args, **kwargs)
 
     @validator("available_models")
     def validate_available_models(cls, v, values):
@@ -448,16 +441,9 @@ class Settings(BaseSettings):
     def _validate_model_config(cls, v, field, values):
         model_config = values["model_config"]
         logger.debug(f"parsing model config: {model_config}")
-        v = ModelOptions(model_config)
+        v = ModelConfig(model_config)
         return v
 
-    @validator("db_connection_string")
-    def _validate_db_connection_string(cls, v, values):
-        if not v:
-            v = f"{values['db_driver']}://{values['db_user']}:{values['db_pass']}@{values['db_host']}:{values['db_port']}/{values['db_name']}"
-            if values["db_options"]:
-                v += f"?{values['db_options']}"
-        return v
 
     @validator("model_config", "log_dir", pre=True, always=True)
     def _validate_path(cls, v, values, field: ModelField) -> Optional[Path]:
@@ -494,6 +480,8 @@ class GlobalConfig(BaseModel):
         default=None, description="Global settings from ENVIRONMENT"
     )
 
+    detectors
+
     class Config:
         arbitrary_types_allowed = True
 
@@ -506,7 +494,6 @@ class Detector:
     model_source: AvailableModel
     processor: ModelProcessor
     options: ModelOptions
-    model: Union[opencv.Detector, face.Face, alpr.Alpr, None]
 
     def __init__(
         self,
@@ -541,7 +528,8 @@ class Detector:
             )
 
         if self.model_source.framework == ModelFrameWork.OPENCV:
-            self.model = opencv.Detector(self.model_source, self.options)
+            from zm_mlapi.ml.opencv import Detector as OpenCVDetector
+            self.model = OpenCVDetector(self.model_source, self.options)
 
     def is_processor_available(self):
         """Check if the processor is available"""
@@ -617,17 +605,7 @@ class Detector:
         return self.model.detect(image)
 
 
-class DetectionRequest(BaseModel):
-    image: UploadFile = File(..., description="Image to run the ML model on")
-    min_conf: float = Field(
-        0.2,
-        le=1.0,
-        ge=0.0,
-        description="Minimum confidence to return a detection expressed as a float between 0.0 and 1.0",
-    )
-    nms_threshold: float = Field(
-        0.4,
-        le=1.0,
-        ge=0.0,
-        description="Non Max Suppression (NMS) threshold to apply to the model results expressed as a float between 0.0 and 1.0",
-    )
+class DetectionRequest(ModelOptions):
+    # image: UploadFile = File(..., description="Image to run the ML model on")
+    processor: ModelProcessor = Field(..., description="Processor to use")
+

@@ -1,14 +1,5 @@
-# Face wrapper class for recognition, detection is completely separate
 
-from portalocker import AlreadyLocked, BoundedSemaphore
-
-from pyzm.helpers.pyzm_utils import str2bool
-from pyzm.helpers.GlobalConfig import GlobalConfig
-
-g: GlobalConfig
-
-
-class Face:
+class Detector:
     def __init__(self, options=None, *args, **kwargs):
         global g
         g = GlobalConfig()
