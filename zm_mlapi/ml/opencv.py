@@ -12,7 +12,7 @@ try:
     import cv2
 except ImportError as e:
     logger.error("OpenCV is not installed, please install it")
-    raise e  
+    raise e
 try:
     import numpy as np
 except ImportError as e:
@@ -23,18 +23,18 @@ except ImportError as e:
 # cv2 version check for unconnected layers fix
 def cv2_version() -> int:
     # Sick and tired of OpenCV playing games....
-    maj, min, patch = "", "", ""
+    _maj, _min, _patch = "", "", ""
     x = cv2.__version__.split(".")
     x_len = len(x)
     if x_len <= 2:
-        maj, min = x
-        patch = "0"
+        _maj, _min = x
+        _patch = "0"
     elif x_len == 3:
-        maj, min, patch = x
-        patch = patch.replace("-dev", "") or "0"
+        _maj, _min, _patch = x
+        _patch = _patch.replace("-dev", "") or "0"
     else:
-        logger.error(f"come and fix me again, cv2.__version__.split(\".\")={x}")
-    return int(maj + min + patch)
+        logger.error(f'come and fix me again, cv2.__version__.split(".")={x}')
+    return int(_maj + _min + _patch)
 
 
 class Detector:
@@ -74,10 +74,13 @@ class Detector:
         logger.debug(f"{LP} loading data from named model: {self.model_name}")
         load_timer = time.perf_counter()
         try:
-            self.net = cv2.dnn.readNet(self.config.input, self.config.config)
+            self.net = cv2.dnn.readNet(
+                self.config.input.as_posix(), self.config.config.as_posix()
+            )
         except Exception as model_load_exc:
             logger.error(
-                f"{LP} Error while loading model file and/or config! (May need to re-download the model/cfg file) => {model_load_exc}"
+                f"{LP} Error while loading model file and/or config! "
+                f"(May need to re-download the model/cfg file) => {model_load_exc}"
             )
             raise ValueError(repr(model_load_exc))
         self.model = cv2.dnn.DetectionModel(self.net)
@@ -119,7 +122,9 @@ class Detector:
         _max = max(col, row)
         result = np.zeros((_max, _max, 3), np.uint8)
         result[0:row, 0:col] = frame
-        logger.debug(f"{LP}squaring image-> before padding: {frame.shape} - after padding: {result.shape}")
+        logger.debug(
+            f"{LP}squaring image-> before padding: {frame.shape} - after padding: {result.shape}"
+        )
         return result
 
     def detect(self, input_image: Optional[np.ndarray] = None, retry: bool = False):
@@ -130,8 +135,10 @@ class Detector:
         class_ids, confidences, boxes = [], [], []
         bbox, label, conf = [], [], []
         h, w = input_image.shape[:2]
-        nms_threshold, conf_threshold = self.options.thresholds.nms, self.options.thresholds.confidence
-        logger.debug(f"{LP} confidence threshold: {conf_threshold} -- NMS threshold: {nms_threshold}")
+        nms_threshold, conf_threshold = self.options.nms, self.options.confidence
+        logger.debug(
+            f"{LP} confidence threshold: {conf_threshold} -- NMS threshold: {nms_threshold}"
+        )
         if self.options.square:
             input_image = self.square_image(input_image)
             h, w = input_image.shape[:2]
@@ -139,11 +146,13 @@ class Detector:
             if not self.net or (self.net and retry):
                 # model has not been loaded or this is a retry detection, so we want to rebuild
                 # the model with changed options.
-                logger.debug(f"DEBUGGING - self.net? {'yes' if self.net else 'no'} -- {retry = } ---<> LOADING MODEL")
+                logger.debug(
+                    f"DEBUGGING - self.net? {'yes' if self.net else 'no'} -- {retry = } ---<> LOADING MODEL"
+                )
                 self.load_model()
             logger.debug(
-                f"{LP} '{self.model_name}' ({self.options.processor}) - input image {w}*{h} - model input set as: "
-                f"{self.options.width}*{self.options.height}"
+                f"{LP} '{self.model_name}' ({self.options.processor.value}) - input image {w}*{h} - "
+                f"model input set as: {self.options.width}*{self.options.height}"
             )
             t = time.perf_counter()
 
@@ -175,9 +184,9 @@ class Detector:
             # API call) invalid device function in function 'make_policy'
             logger.error(f"{LP} exception during detection -> {all_ex}")
             if (
-                err_msg.find("-217:Gpu") > 0
-                and err_msg.find("'make_policy'") > 0
-                and self.options.processor == ModelProcessor.GPU
+                    err_msg.find("-217:Gpu") > 0
+                    and err_msg.find("'make_policy'") > 0
+                    and self.options.processor == ModelProcessor.GPU
             ):
                 logger.error(
                     f"{LP} (-217:Gpu # API call) invalid device function in function 'make_policy' - "
@@ -195,29 +204,16 @@ class Detector:
             raise Exception(f"during detection -> {all_ex}")
         diff_time = time.perf_counter() - t
         logger.debug(
-            2,
-            f"perf:{LP}{self.options.processor}: '{self.options.name}' detection took: {diff_time}",
+            f"perf:{LP}{self.options.processor}: '{self.config.name}' detection took: {diff_time}",
         )
-        if label:
-            logger.debug(f"{LP} {label} -- {bbox} -- {conf}")
-        else:
+        _model_name = [f"{self.model_name}[{self.options.processor}]"] * len(label)
+        if not label:
             logger.debug(f"{LP} no detections to return!")
-        _model_name = [
-            f"{self.model_name}[{self.options.processor}]"
-        ] * len(label)
-        logger.debug(f"DBG => {_model_name = }")
-
-        return bbox, label, conf, _model_name
-        # from collections import namedtuple
-        # detection = namedtuple("detection", "label bbox conf model_name")
-        # detections = []
-        # for i in range(len(label)):
-        #     detections.append(
-        #         detection(
-        #             label=label[i],
-        #             bbox=bbox[i],
-        #             conf=conf[i],
-        #             model_name=_model_name[i],
-        #         )
-        #     )
-        # return detections
+        return {
+            "type": self.config.model_type,
+            "processor": self.options.processor,
+            "model_name": self.config.name,
+            "label": label,
+            "confidence": conf,
+            "bounding_box": bbox,
+        }

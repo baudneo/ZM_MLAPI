@@ -1,10 +1,11 @@
+import inspect
 import logging
 import sys
 import time
 from functools import lru_cache
 from pathlib import Path
 from platform import python_version
-from typing import Union, Optional
+from typing import Union, Optional, Type, Tuple, List, Dict
 
 import cv2
 import numpy as np
@@ -16,16 +17,20 @@ from fastapi import (
     File,
     UploadFile,
     __version__ as fastapi_version,
-    Path as PathParam,
-    Query as QueryParam,
-    Body,
     Form,
+    Depends,
 )
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
 
-from zm_mlapi.imports import Settings, GlobalConfig, ModelOptions, APIDetector
-
-__db_driver__ = "mysql+pymysql://"
+from zm_mlapi.imports import (
+    Settings,
+    GlobalConfig,
+    ModelOptions,
+    APIDetector,
+    AvailableModel,
+    DetectionResult,
+)
 
 # mysql+pymysql://<username>:<password>@<host>/<dbname>[?<options>]
 __version__ = "0.0.1"
@@ -34,7 +39,7 @@ __version_type__ = "dev"
 logger = logging.getLogger("zm_mlapi")
 logger.setLevel(logging.INFO)
 formatter = logging.Formatter(
-    "%(asctime)s.%(msecs)04d %(name)s[%(process)s] %(levelname)s %(module)s:%(lineno)d->[%(message)s]",
+    "%(asctime)s.%(msecs)04d %(name)s[%(process)s] %(levelname)s %(module)s:%(lineno)d -> %(message)s",
     "%m/%d/%y %H:%M:%S",
 )
 # 08/28/22 11:17:10.794009 zm_mlapi[170] DBG1 pyzm_utils:1567->
@@ -43,11 +48,41 @@ stream_handler.setFormatter(formatter)
 logger.addHandler(stream_handler)
 
 logger.info(
-    f"ZM_MLAPI: {__version__} (type: {__version_type__}) [Python: {python_version()} - OpenCV: {cv2.__version__} - Numpy: {np.__version__} - FastAPI: {fastapi_version} - Pydantic: {pydantic.VERSION}]"
+    f"ZM_MLAPI: {__version__} (type: {__version_type__}) [Python: {python_version()} - "
+    f"OpenCV: {cv2.__version__} - Numpy: {np.__version__} - FastAPI: {fastapi_version} - "
+    f"Pydantic: {pydantic.VERSION}]"
 )
 
 app = FastAPI()
 g = GlobalConfig()
+
+
+# Allow Form() to contain JSON, Nested JSON is not allowed though
+def as_form(cls: Type[BaseModel]):
+    new_parameters = []
+
+    for field_name, model_field in cls.__fields__.items():
+        model_field: ModelField  # type: ignore
+
+        new_parameters.append(
+            inspect.Parameter(
+                model_field.alias,
+                inspect.Parameter.POSITIONAL_ONLY,
+                default=Form(...)
+                if not model_field.required
+                else Form(model_field.default),
+                annotation=model_field.outer_type_,
+            )
+        )
+
+    async def as_form_func(**data):
+        return cls(**data)
+
+    sig = inspect.signature(as_form_func)
+    sig = sig.replace(parameters=new_parameters)
+    as_form_func.__signature__ = sig  # type: ignore
+    setattr(cls, "as_form", as_form_func)
+    return cls
 
 
 @lru_cache()
@@ -74,15 +109,26 @@ async def available_models():
 
 
 # upload an image for inference
-@app.post("/detect/{model_uuid}", summary="Run detection on an image")
+@app.post(
+    "/detect/{model_uuid}",
+    summary="Run detection on an image",
+    response_model=DetectionResult,
+)
 async def object_detection(
     model_uuid: str,
-    model_options: ModelOptions = Form(),
+    model_options: ModelOptions = Depends(),
     image: UploadFile = File(..., description="Image to run the ML model on"),
 ):
     logger.info(f"Running detection on image '{image.filename}'")
     model_uuid = model_uuid.lower().strip()
-    if model_uuid not in g.available_models:
+    model: Optional[AvailableModel] = None
+    for _model in g.available_models:
+        if str(_model.id) == model_uuid:
+            logger.debug(f"Found model: {_model.id} NAME: {_model.name}")
+            model = _model
+            break
+
+    if not model:
         raise HTTPException(status_code=404, detail="Model UUID not found")
     # Check if a detector is already configured using the MODEL and PROCESSOR type, if so, use it with
     # the new image and options
@@ -93,7 +139,7 @@ async def object_detection(
     # check if a detector already exists for this model and processor
     for detector in detectors:
         if (
-            detector.model_config.id == model_uuid
+            str(detector.model_config.id) == model_uuid
             and detector.model_options.processor == model_options.processor
         ):
             logger.info(f"Using existing detector for model {model_uuid} -> {detector}")
@@ -101,20 +147,21 @@ async def object_detection(
             break
     else:
         # create a new detector and append to the list
-        model = g.available_models[model_uuid]
         detector = APIDetector(model, model_options)
         detectors.append(detector)
         logger.info(f"Created new detector for model {model_uuid} -> {detector}")
     # now we have a detector, use it
     frame = load_image_into_numpy_array(await image.read())
-    return await detector.detect(frame)
+    detections: Dict = detector.detect(frame)
+    logger.info(f"detections -> {detections}")
+    return detections
 
 
 def load_image_into_numpy_array(data):
     npimg = np.frombuffer(data, np.uint8)
-    # frame = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
+    frame = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
     # cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    return npimg
+    return frame
 
 
 class MLAPI:
@@ -164,6 +211,7 @@ class MLAPI:
 
     def start_server(self):
         logger.info("running server")
+        logger.info(f"{str(get_global_config().available_models[0].id)}")
         uvicorn_log_config = {
             "version": 1,
             "disable_existing_loggers": True,
@@ -202,13 +250,9 @@ class MLAPI:
                     "level": "DEBUG",
                     "propagate": False,
                 },
-                "zm_mlapi": {
-                    "handlers": ["default"],
-                    "level": "DEBUG"
-                },
+                "zm_mlapi": {"handlers": ["default"], "level": "DEBUG"},
             },
         }
-        log_config = uvicorn.config.LOGGING_CONFIG
         uvicorn.LOGGING_CONFIG = uvicorn_log_config
         config = uvicorn.Config(
             "zm_mlapi.app:app",
@@ -216,7 +260,7 @@ class MLAPI:
             port=self.cached_settings.port,
             reload=self.cached_settings.reload,
             debug=self.cached_settings.debug,
-            log_config=uvicorn_log_config,
+            # log_config=uvicorn_log_config,
             log_level="debug",
         )
         lifetime = time.perf_counter()

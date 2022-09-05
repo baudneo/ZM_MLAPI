@@ -96,21 +96,16 @@ class ModelProcessor(str, Enum):
 
 class DetectionResult(BaseModel):
     type: ModelType = None
-    label: str = None
-    confidence: float = None
-    bounding_box: tuple[Union[float, int]] = None
+    processor: ModelProcessor = None
     model_name: str = None
 
-
-class ModelThresholds(BaseModel):
-    confidence: float = Field(0.5, ge=0.0, le=1.0, descritpiton="Confidence Threshold")
-    nms: float = Field(
-        0.4, ge=0.0, le=1.0, description="Non-Maximum Suppression Threshold"
-    )
+    label: List[str] = None
+    confidence: List[Union[float, int]] = None
+    bounding_box: List[List[Union[float, int]]] = None
 
 
 class ModelOptions(BaseModel):
-    processor: ModelProcessor = Field(None, description="Processor to use for model")
+    processor: ModelProcessor = Field(ModelProcessor.CPU, description="Processor to use for model")
     height: int = Field(
         416, ge=1, description="Height of the input image (resized for model)"
     )
@@ -119,14 +114,14 @@ class ModelOptions(BaseModel):
     )
     square: bool = Field(False, description="Zero pad the image to be a square")
     fp_16: bool = Field(False, description="model uses Floating Point 16 Backend (EXPERIMENTAL!)")
-
-    thresholds: ModelThresholds = Field(
-        default_factory=ModelThresholds, description="Thresholds for the model"
+    confidence: float = Field(0.5, ge=0.0, le=1.0, descritpiton="Confidence Threshold")
+    nms: float = Field(
+        0.4, ge=0.0, le=1.0, description="Non-Maximum Suppression Threshold"
     )
 
 
 class AvailableModel(BaseModel):
-    id: int = Field(default_factory=uuid.uuid4, description="Unique ID of the model")
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, description="Unique ID of the model")
     name: str = Field(..., description="model name")
     input: Path = Field(..., description="model file/dir path")
     enabled: bool = Field(True, description="model enabled")
@@ -477,6 +472,8 @@ class APIDetector:
     model_options: ModelOptions
     model_processor: ModelProcessor
 
+    def __repr__(self):
+        return f"{self.__class__.__name__}({self.model_config}) Options: {self.model_options}"
     def __init__(
         self,
         model: AvailableModel,
@@ -516,7 +513,9 @@ class APIDetector:
     def is_processor_available(self):
         """Check if the processor is available"""
         available = False
-        if self.model_processor == ModelProcessor.TPU:
+        if self.model_processor == ModelProcessor.CPU:
+            available = True
+        elif self.model_processor == ModelProcessor.TPU:
             if self.model_config.framework == ModelFrameWork.CORAL:
                 try:
                     import pycoral
@@ -588,7 +587,7 @@ class APIDetector:
 
 
 class GlobalConfig(BaseModel):
-    available_models: Dict[str, AvailableModel] = Field(
+    available_models: List[AvailableModel] = Field(
         default_factory=dict, description="Available models, call by ID"
     )
     settings: Settings = Field(
