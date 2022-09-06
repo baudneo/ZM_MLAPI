@@ -3,10 +3,13 @@ from zm_mlapi.schemas import (
     ModelFrameWork,
     ModelProcessor,
     ModelOptions,
-    AvailableModel,
+    MLModelConfig,
     Settings,
     GlobalConfig,
     APIDetector,
     DetectionResult,
+    FaceModelOptions,
+    FaceModel,
+    ALPRModelOptions,
 )
 

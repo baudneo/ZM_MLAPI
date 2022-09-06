@@ -3,7 +3,7 @@ import uuid
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Union, List, Dict, Optional, IO
+from typing import Union, List, Dict, Optional, IO, Any
 
 import numpy as np
 from fastapi import UploadFile, File, Form
@@ -95,7 +95,14 @@ class ModelProcessor(str, Enum):
     DEFAULT = CPU
 
 
+class FaceModel(str, Enum):
+    CNN = "cnn"
+    HOG = "hog"
+    DEFAULT = CNN
+
+
 class DetectionResult(BaseModel):
+    detections: bool = False
     type: ModelType = None
     processor: ModelProcessor = None
     model_name: str = None
@@ -129,7 +136,66 @@ class ModelOptions(BaseModel):
     )
 
 
-class AvailableModel(BaseModel):
+class FaceModelOptions(ModelOptions):
+    # Face Detection Options
+    upsample_times: int = Field(
+        1,
+        ge=1,
+        description="How many times to upsample the image looking for faces. Higher numbers find smaller faces but take longer.",
+    )
+    num_jitters: int = Field(
+        1,
+        ge=1,
+        description="How many times to re-sample the face when calculating encoding. Higher is more accurate, but slower (i.e. 100 is 100x slower)",
+    )
+    face_model: FaceModel = Field(
+        FaceModel.DEFAULT, description="Face model to use for detection"
+    )
+    face_train_model: FaceModel = Field(
+        FaceModel.DEFAULT, description="Face model to use for training"
+    )
+    known_faces_dir: Optional[Union[Path, str]] = Field(
+        None, description="Path to parent directory for known faces"
+    )
+    face_max_size: int = Field(
+        600,
+        ge=1,
+        description="Maximum size (Width) of image to load into memory for "
+        "face detection",
+    )
+    recognition_threshold: float = Field(
+        0.6,
+        ge=0.0,
+        le=1.0,
+        description="Recognition distance threshold for " "face recognition",
+    )
+    unknown_face_name: str = Field(
+        "Unknown", description="Name to use for unknown faces"
+    )
+    save_unknown_faces: bool = Field(
+        False,
+        description="Save cropped unknown faces to disk, can be "
+        "used to train a model",
+    )
+    unknown_faces_leeway_pixels: int = Field(
+        0,
+        description="Unknown faces leeway pixels, used when cropping the image to capture a face",
+    )
+    unknown_faces_dir: Optional[Union[Path, str]] = Field(
+        None, description="Directory to save unknown faces to"
+    )
+    face_train_max_size: int = Field(
+        800,
+        description="Maximum size of image to load into memory for face training, "
+        "Larger will consume more memory!",
+    )
+
+
+class ALPRModelOptions(ModelOptions):
+    test: str = None
+
+
+class MLModelConfig(BaseModel):
     id: uuid.UUID = Field(
         default_factory=uuid.uuid4, description="Unique ID of the model"
     )
@@ -236,7 +302,7 @@ class ModelSequence(BaseModel):
     based_on: uuid.UUID = Field(
         ..., description="UUID of the available model to base the sequence on"
     )
-    __source_model__: AvailableModel = Field(
+    __source_model__: MLModelConfig = Field(
         None, description="The source model", repr=False, exclude=True
     )
 
@@ -269,7 +335,7 @@ class ModelSequence(BaseModel):
     @validator("based_on", always=True, pre=True)
     def _validate_based_on(
         cls, v, values, field: ModelField
-    ) -> Optional[AvailableModel]:
+    ) -> Optional[MLModelConfig]:
         from zm_mlapi.app import get_global_config
 
         g = get_global_config()
@@ -297,7 +363,7 @@ class ModelSequence(BaseModel):
         return v
 
 
-class ModelConfig:
+class ModelConfigFromFile:
     file: Path
     raw: str
     parsed_raw: dict
@@ -410,19 +476,18 @@ class Settings(BaseSettings):
     host: str = Field(default="0.0.0.0", description="Interface IP to listen on")
     port: int = Field(default=5000, description="Port to listen on")
     jwt_secret: str = Field(default="CHANGE ME", description="JWT signing key")
+    file_logger: bool = Field(False, description="Enable file logging")
+    file_log_name: str = Field("zm_mlapi.log", description="File log name")
 
     reload: bool = Field(
         default=False, description="Uvicorn reload - For development only"
     )
     debug: bool = Field(default=False, description="Debug mode - For development only")
 
-    models: ModelConfig = Field(None, description="ModelConfig object", exclude=True)
-    available_models: List[AvailableModel] = Field(None, description="Available models")
-
-    # def __init__(self, args, **kwargs):
-    #     logger.info(f"Settings: {args = } -- {kwargs = }")
-    #     print(f"Settings: {args = } -- {kwargs = }")
-    #     super().__init__(args, **kwargs)
+    models: ModelConfigFromFile = Field(
+        None, description="ModelConfig object", exclude=True
+    )
+    available_models: List[MLModelConfig] = Field(None, description="Available models")
 
     @validator("available_models")
     def validate_available_models(cls, v, values):
@@ -430,7 +495,7 @@ class Settings(BaseSettings):
         if models:
             v = []
             for model in models.parsed.get("models"):
-                v.append(AvailableModel(**model))
+                v.append(MLModelConfig(**model))
         return v
 
     @validator("debug")
@@ -447,7 +512,7 @@ class Settings(BaseSettings):
     def _validate_model_config(cls, v, field, values):
         model_config = values["model_config"]
         logger.debug(f"parsing model config: {model_config}")
-        v = ModelConfig(model_config)
+        v = ModelConfigFromFile(model_config)
         return v
 
     @validator("model_config", "log_dir", pre=True, always=True)
@@ -473,26 +538,34 @@ class Settings(BaseSettings):
 
 
 class APIDetector:
-    """Base class for detectors
+    """ML detector API class.
     Specify a processor type and then load the model into processor memory. run an inference on the processor
     """
 
-    model_config: AvailableModel
+    model_config: MLModelConfig
     model_options: ModelOptions
     model_processor: ModelProcessor
 
     def __repr__(self):
-        return f"{self.__class__.__name__}({self.model_config}) Options: {self.model_options}"
+        return f"{self.__class__.__name__}({self.model_config} <--> Options: {self.model_options})"
+
+    def __get__(self, instance, owner):
+        return self
 
     def __init__(
         self,
-        model: AvailableModel,
-        options: Optional[ModelOptions] = None,
+        model: MLModelConfig,
+        options: Optional[
+            Union[ModelOptions, FaceModelOptions, ALPRModelOptions]
+        ] = None,
     ):
         self.model_options = options
         self.model_config = model
         if not self.model_options.processor:
             if model.framework == ModelFrameWork.CORAL:
+                logger.warning(
+                    f"Using default processor for {model.framework} -> {ModelProcessor.TPU}"
+                )
                 self.model_options.processor = ModelProcessor.TPU
             else:
                 self.model_options.processor = ModelProcessor.CPU
@@ -511,21 +584,30 @@ class APIDetector:
             )
 
         if self.model_config.framework == ModelFrameWork.OPENCV:
-            from zm_mlapi.ml.opencv import Detector as OpenCVDetector
+            from zm_mlapi.ml.opencv import OpenCVDetector as OpenCVDetector
 
             self.model = OpenCVDetector(self.model_config, self.model_options)
 
     def set_model_options(self, options: ModelOptions):
+        if not options:
+            logger.warning("No options specified, using existing options")
+            return
         if options != self.model_options:
+            logger.debug(f"updating (reloading) model with options: {options}")
             self.model_options = options
             self._load_model()
-        self.model_options = options
 
     def is_processor_available(self):
         """Check if the processor is available"""
         available = False
         if self.model_processor == ModelProcessor.CPU:
-            available = True
+            if self.model_config.framework == ModelFrameWork.CORAL:
+                logger.error(
+                    f"{self.model_processor} is not supported for {self.model_config.framework}"
+                )
+            else:
+                available = True
+
         elif self.model_processor == ModelProcessor.TPU:
             if self.model_config.framework == ModelFrameWork.CORAL:
                 try:
@@ -553,11 +635,12 @@ class APIDetector:
                         "OpenCV does not have CUDA enabled/compiled, cannot load any models that use the GPU processor"
                     )
                 else:
-                    if not cv2.cuda.getCudaEnabledDeviceCount():
+                    if not (cuda_devices := cv2.cuda.getCudaEnabledDeviceCount()):
                         logger.warning(
                             "No CUDA devices found, cannot load any models that use the GPU processor"
                         )
                     else:
+                        logger.debug(f"Found {cuda_devices} CUDA device(s)")
                         available = True
             elif self.model_config.framework == ModelFrameWork.TENSORFLOW:
                 try:
@@ -589,14 +672,14 @@ class APIDetector:
                         available = True
         return available
 
-    def detect(self, image: np.ndarray):
+    def detect(self, image: np.ndarray) -> Dict[str, Any]:
         """Detect objects in the image"""
         assert self.model, "model not loaded"
         return self.model.detect(image)
 
 
 class GlobalConfig(BaseModel):
-    available_models: List[AvailableModel] = Field(
+    available_models: List[MLModelConfig] = Field(
         default_factory=dict, description="Available models, call by ID"
     )
     settings: Settings = Field(

@@ -2,7 +2,6 @@ import inspect
 import logging
 import sys
 import time
-from functools import lru_cache
 from pathlib import Path
 from platform import python_version
 from typing import Union, Optional, Type, Dict
@@ -27,8 +26,10 @@ from zm_mlapi.imports import (
     Settings,
     GlobalConfig,
     ModelOptions,
+    FaceModelOptions,
+    ALPRModelOptions,
     APIDetector,
-    AvailableModel,
+    MLModelConfig,
     DetectionResult,
 )
 
@@ -92,14 +93,50 @@ async def docs():
     return RedirectResponse(url="/docs")
 
 
-@app.get("/available_models")
+@app.get("/available_models", summary="Get a list of available models")
 async def available_models():
     return {"models": get_global_config().available_models}
 
 
+def get_detector(
+    model_uuid: str,
+    model: MLModelConfig,
+    model_options: Union[ModelOptions, FaceModelOptions, ALPRModelOptions],
+):
+    detectors = get_global_config().detectors
+    detector: Optional[APIDetector] = None
+    # check if a detector already exists for this model and processor
+    for detector in detectors:
+        if (
+            str(detector.model_config.id) == model_uuid
+            and detector.model_options.processor == model_options.processor
+        ):
+            logger.info(
+                f"Using existing {detector.model_processor} detector for model {model_uuid} -> {detector}"
+            )
+            # set model_options on existing detector, if they are different the model will be reloaded into memory
+            # TODO: only reload on certain keys being different
+            detector.set_model_options(model_options)
+            break
+    else:
+        # create a new detector and append to the list
+        detector = APIDetector(model, model_options)
+        detectors.append(detector)
+        logger.info(f"Created new detector for model {model_uuid} -> {detector}")
+    return detector
+
+
+def get_available_model(model_uuid: str) -> MLModelConfig:
+    available_models = get_global_config().available_models
+    for model in available_models:
+        if str(model.id) == model_uuid:
+            return model
+    raise HTTPException(status_code=404, detail=f"Model {model_uuid} not found")
+
+
 # upload an image for inference
 @app.post(
-    "/detect/{model_uuid}",
+    "/detect/object/{model_uuid}",
     summary="Run detection on an image",
     response_model=DetectionResult,
 )
@@ -109,36 +146,46 @@ async def object_detection(
     image: UploadFile = File(..., description="Image to run the ML model on"),
 ):
     model_uuid = model_uuid.lower().strip()
-    model: Optional[AvailableModel] = None
-    for _model in g.available_models:
-        if str(_model.id) == model_uuid:
-            logger.debug(f"Found model: {_model.id} NAME: {_model.name}")
-            model = _model
-            break
+    model: MLModelConfig = get_available_model(model_uuid)
+    detector: Optional[APIDetector] = get_detector(model_uuid, model, model_options)
+    frame = load_image_into_numpy_array(await image.read())
+    detections: Dict = detector.detect(frame)
+    logger.info(f"detections -> {detections}")
+    return detections
 
-    if not model:
-        raise HTTPException(status_code=404, detail="Model UUID not found")
-    # Check if a detector is already configured using the MODEL and PROCESSOR type, if so, use it with
-    # the new image and options
-    # If not, create a new detector and use it
 
-    detectors = get_global_config().detectors
-    detector: Optional[APIDetector] = None
-    # check if a detector already exists for this model and processor
-    for detector in detectors:
-        if (
-            str(detector.model_config.id) == model_uuid
-            and detector.model_options.processor == model_options.processor
-        ):
-            logger.info(f"Using existing detector for model {model_uuid} -> {detector}")
-            detector.set_model_options(model_options)
-            break
-    else:
-        # create a new detector and append to the list
-        detector = APIDetector(model, model_options)
-        detectors.append(detector)
-        logger.info(f"Created new detector for model {model_uuid} -> {detector}")
-    # now we have a detector, use it
+@app.post(
+    "/detect/face/{model_uuid}",
+    summary="Run Face detection/recognition on an image",
+    response_model=DetectionResult,
+)
+async def face_detection(
+    model_uuid: str,
+    model_options: FaceModelOptions = Depends(),
+    image: UploadFile = File(..., description="Image to run the ML model on"),
+):
+    model_uuid = model_uuid.lower().strip()
+    model: MLModelConfig = get_available_model(model_uuid)
+    detector: Optional[APIDetector] = get_detector(model_uuid, model, model_options)
+    frame = load_image_into_numpy_array(await image.read())
+    detections: Dict = detector.detect(frame)
+    logger.info(f"detections -> {detections}")
+    return detections
+
+
+@app.post(
+    "/detect/alpr/{model_uuid}",
+    summary="Run ALPR detection on an image",
+    response_model=DetectionResult,
+)
+async def alpr_detection(
+    model_uuid: str,
+    model_options: ALPRModelOptions = Depends(),
+    image: UploadFile = File(..., description="Image to run the ML model on"),
+):
+    model_uuid = model_uuid.lower().strip()
+    model: MLModelConfig = get_available_model(model_uuid)
+    detector: Optional[APIDetector] = get_detector(model_uuid, model, model_options)
     frame = load_image_into_numpy_array(await image.read())
     detections: Dict = detector.detect(frame)
     logger.info(f"detections -> {detections}")

@@ -3,7 +3,7 @@ from logging import getLogger
 from typing import Optional
 
 
-from zm_mlapi.imports import ModelProcessor, ModelOptions, AvailableModel
+from zm_mlapi.imports import ModelProcessor, ModelOptions, MLModelConfig
 
 LP: str = "OpenCV DNN:"
 logger = getLogger("zm_mlapi")
@@ -35,12 +35,12 @@ def cv2_version() -> int:
     return int(_maj + _min + _patch)
 
 
-class Detector:
-    def __init__(self, model_config: AvailableModel, model_options: ModelOptions):
+class OpenCVDetector:
+    def __init__(self, model_config: MLModelConfig, model_options: ModelOptions):
         if not model_config:
             raise ValueError(f"{LP} no config passed!")
         # Model init params
-        self.config: AvailableModel = model_config
+        self.config: MLModelConfig = model_config
         self.options: ModelOptions = model_options
         self.processor: ModelProcessor = self.options.processor
         self.model_name = self.config.name
@@ -136,7 +136,7 @@ class Detector:
             raise ValueError("NO_IMAGE")
         if self.options.square:
             input_image = self.square_image(input_image)
-        class_ids, confidences, boxes = [], [], []
+        classes, confs, boxes = [], [], []
         bboxs, labels, confs = [], [], []
         h, w = input_image.shape[:2]
         nms_threshold, conf_threshold = self.options.nms, self.options.confidence
@@ -151,14 +151,14 @@ class Detector:
             )
             detection_timer = time.perf_counter()
 
-            class_ids, confidences, boxes = self.model.detect(
+            classes, confidences, boxes = self.model.detect(
                 input_image, conf_threshold, nms_threshold
             )
             logger.debug(
                 f"perf:{LP}{self.options.processor}: '{self.model_name}' detection "
                 f"took: {time.perf_counter() - detection_timer:.5f}ms"
             )
-            for (class_id, confidence, box) in zip(class_ids, confidences, boxes):
+            for (class_id, confidence, box) in zip(classes, confidences, boxes):
                 confidence = float(confidence)
                 if confidence >= conf_threshold:
                     x, y, _w, _h = (
@@ -202,8 +202,6 @@ class Detector:
                 self.detect(input_image, retry=True)
             raise Exception(f"during detection -> {all_ex}")
 
-        if not labels:
-            logger.debug(f"{LP} no detections to return!")
         return {
             "detections": True if labels else False,
             "type": self.config.model_type,

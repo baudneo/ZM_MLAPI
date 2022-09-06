@@ -3,328 +3,388 @@ import pickle
 import time
 from pathlib import Path
 from typing import Optional
+from logging import getLogger
+
+import numpy as np
+
+from zm_mlapi.imports import (
+    ModelProcessor,
+    FaceModelOptions,
+    FaceModel,
+    MLModelConfig,
+    ModelFrameWork,
+)
 
 import cv2
-import portalocker
+from sklearn import neighbors
 
-from pyzm.helpers.GlobalConfig import GlobalConfig
-from pyzm.helpers.pyzm_utils import Timer, id_generator, resize_image, str2bool
-from pyzm.ml.face import Face
+logger = getLogger("zm_mlapi")
 
-g: GlobalConfig
 face_recognition = None
 dlib = None
-lp = "dlib:face:"
+LP = "Face:DLib:"
 
 
 # Class to handle face recognition
-class FaceDlib(Face):
-    def __init__(self, options: Optional[dict] = None, *args, **kwargs):
-        global g, face_recognition, dlib
-        g = GlobalConfig()
-        import_start: Optional[Timer] = None
-        import_end_time: Optional[Timer] = None
+class DLibFaceDetector:
+    def __init__(self, model_config: MLModelConfig, model_options: FaceModelOptions):
+        if not model_config:
+            raise ValueError(f"{LP} no config passed!")
+        # Model init params
+        self.config: MLModelConfig = model_config
+        self.options: FaceModelOptions = model_options
+        self.processor: ModelProcessor = self.options.processor
+        self.model_name: str = self.config.name
+        self.knn: Optional[neighbors.KNeighborsClassifier] = None
+        self.downscaled: bool = False
+        self.x_factor: float = 1.0
+        self.y_factor: float = 1.0
+        self.original_image: Optional[np.ndarray] = None
+
+        self.face_locations: list = []
+        self.face_encodings: list = []
+        self.trained_faces_file: Optional[Path] = None
+
+        import_timer: time.perf_counter
+        import_end_time: time.perf_counter
         try:
+            global dlib
+
             import dlib
         except ImportError as e:
-            g.log.error(f"{lp} UNABLE to import DLIB library, is it installed?")
-            return
+            logger.error(f"{LP} UNABLE to import DLIB library, is it installed?")
+            raise e
         else:
-            g.log.debug(f"{lp} successfully imported DLIB library")
+            logger.debug(f"{LP} successfully imported DLIB library")
 
         try:
-            import_start = Timer()
+            import_timer = time.perf_counter()
+            global face_recognition
+
             import face_recognition
         except ImportError as e:
-            g.log.error(f"{lp} Could not import face_recognition library, is it installed?")
-            return
+            logger.error(
+                f"{LP} Could not import face_recognition library, is it installed?"
+            )
+            raise e
         else:
-            import_end_time = import_start.stop_and_get_ms()
-            g.log.debug(f"{lp} successfully imported face_recognition library!")
-
-        if options is None:
-            options = {}
-        self.lp = lp
-        self.options = options
-        self.sequence_name: str = self.options.get("name")
-        g.log.debug(4, f"{lp} init params: {options}")
+            import_end_time = time.perf_counter() - import_timer
+            logger.debug(f"{LP} successfully imported face_recognition library!")
+        logger.debug(f"{LP} init params: {model_options}")
         dlib: dlib
         face_recognition: face_recognition
-        self.processor = options.get("face_dlib_processor", "gpu")
-        if dlib.DLIB_USE_CUDA and dlib.cuda.get_num_devices() >= 1 and self.processor == "gpu":
-            g.log.debug(
-                f"{lp} dlib was compiled with CUDA support and there is an available GPU "
-                f"to use for processing! (Total GPUs dlib could use: {dlib.cuda.get_num_devices()})"
-            )
-            self.processor = "gpu"
-        elif dlib.DLIB_USE_CUDA and not dlib.cuda.get_num_devices() >= 1 and self.processor == "gpu":
-            g.log.error(
-                f"{lp} It appears dlib was compiled with CUDA support but there is not an available GPU "
-                f"for dlib to use! Using CPU for dlib detections..."
-            )
-            self.processor = "cpu"
-        elif not dlib.DLIB_USE_CUDA and self.processor == "gpu":
-            g.log.error(f"{lp} It appears dlib was not compiled with CUDA support! Using CPU for dlib detections...")
-            self.processor = "cpu"
-        else:
-            self.processor = "cpu"
+        if self.processor == ModelProcessor.GPU:
+            if dlib.DLIB_USE_CUDA and dlib.cuda.get_num_devices() >= 1:
+                logger.debug(
+                    f"{LP} dlib was compiled with CUDA support and there is an available GPU "
+                    f"to use for processing! (Total GPUs dlib could use: {dlib.cuda.get_num_devices()})"
+                )
+            elif dlib.DLIB_USE_CUDA and not dlib.cuda.get_num_devices() >= 1:
+                logger.error(
+                    f"{LP} It appears dlib was compiled with CUDA support but there is not an available GPU "
+                    f"for dlib to use! Using CPU for dlib detections..."
+                )
+                self.processor = ModelProcessor.CPU
+            elif not dlib.DLIB_USE_CUDA:
+                logger.error(
+                    f"{LP} It appears dlib was not compiled with CUDA support! "
+                    f"Using CPU for dlib detections..."
+                )
+                self.processor = ModelProcessor.CPU
+
         if import_end_time:
-            g.log.debug(f"perf:{lp}{self.processor}: importing Face Recognition library took: {import_end_time}")
+            logger.debug(
+                f"perf:{LP}{self.processor}: importing Face Recognition library "
+                f"took: {import_end_time:.5f}ms"
+            )
 
-        self.upsample_times = int(self.options.get("face_upsample_times", 1))
-        self.num_jitters = int(self.options.get("face_num_jitters", 0))
-        model = self.options.get("face_model", "hog")
-
-        g.log.debug(
-            f"{lp} initializing face_recognition with DNN model: '{model}' upsample_times: {self.upsample_times},"
-            f" num_jitters (distort): {self.num_jitters}"
+        logger.debug(
+            f"{LP} initializing face_recognition library with DNN model: '{self.options.face_model}'"
         )
 
-        self.disable_locks = options.get("disable_locks", "no")
-        if options.get("face_model"):
-            self.face_model = options.get("face_model")
+    def load_trained_faces(self, faces_file: Optional[Path] = None):
+        if faces_file and faces_file.is_file():
+            self.trained_faces_file = faces_file
         else:
-            self.face_model = model
-
-        self.knn = None
-        self.options = options
-        self.is_locked = False
-
-        self.lock_maximum = int(options.get(self.processor + "_max_processes") or 10)
-        self.lock_timeout = int(options.get(self.processor + "_max_lock_wait") or 220)
-
-        # self.lock_name='pyzm_'+self.processor+'_lock'
-        self.lock_name = f"pyzm_uid{os.getuid()}_{self.processor.upper()}_lock"
-        if not str2bool(self.disable_locks):
-            g.log.debug(
-                2,
-                f"{lp}portalock: [max: {self.lock_maximum}] [name: {self.lock_name}] "
-                f"[timeout: {self.lock_timeout}]",
+            self.trained_faces_file = Path(
+                f"{self.options.known_faces_dir}/trained_faces.dat"
             )
-            self.lock = portalocker.BoundedSemaphore(
-                maximum=self.lock_maximum, name=self.lock_name, timeout=self.lock_timeout
-            )
-
-        encoding_file_name = f"{self.options.get('known_images_path')}/faces.dat"
         # to increase performance, read encodings from file
-        if Path(encoding_file_name).is_file():
-            g.log.debug(
-                f"{lp} pre-trained (known) faces found. If you want to add new images, "
-                f"remove: '{encoding_file_name}'"
+        if self.trained_faces_file.is_file():
+            logger.debug(
+                f"{LP} Trained faces file found. If you want to add new images/people, "
+                f"remove: '{self.trained_faces_file}' and retrain"
             )
-        try:
-            with Path(encoding_file_name).open("rb") as f:
-                self.knn = pickle.load(f)
-        except Exception as e:
-            g.log.error(f"{lp} error loading KNN model from faces.dat -> {e}")
-            return
+            try:
+                with self.trained_faces_file.open("rb") as f:
+                    knn = pickle.load(f)
+                    self.knn = knn
+            except Exception as e:
+                logger.error(
+                    f"{LP} error loading KNN model from '{self.trained_faces_file}' -> {e}"
+                )
+                raise e
+        else:
+            logger.error(
+                f"{LP} trained faces file not found! Please train the model first!"
+            )
+            raise FileNotFoundError(
+                f"{LP} trained faces file not found! Please train the model first!"
+            )
 
     def get_options(self):
         return self.options
 
-    # def acquire_lock(self):
-    #     if str2bool(self.disable_locks):
-    #         return
-    #     if self.is_locked:
-    #         g.logger.debug(2, f"{lp}portalock: already acquired -> '{self.lock_name}'")
-    #         return
-    #     try:
-    #         g.logger.debug(2, f"{lp}portalock: Waiting for '{self.lock_name}'")
-    #         self.lock.acquire()
-    #         g.logger.debug(2, f"{lp}portalock: acquired -> '{self.lock_name}'")
-    #         self.is_locked = True
-    #
-    #     except portalocker.AlreadyLocked:
-    #         g.logger.error(f"{lp}portalock: Timeout waiting for -> '{self.lock_timeout}' sec: {self.lock_name}")
-    #         raise ValueError(f"portalock: Timeout waiting for {self.lock_timeout} sec: {self.lock_name}")
-
-    # def release_lock(self):
-    #     if str2bool(self.disable_locks):
-    #         return
-    #     if not self.is_locked:
-    #         # g.logger.debug(2, f"portalock: already released: {self.lock_name}")
-    #         return
-    #     self.lock.release()
-    #     self.is_locked = False
-    #     g.logger.debug(2, f"{lp}portalock: released -> '{self.lock_name}'")
-
     def get_classes(self):
         if self.knn:
             return self.knn.classes_
-        else:
-            return []
+        return []
 
-    @staticmethod
-    def _rescale_rects(a):
-        rects = []
-        for (left, top, right, bottom) in a:
-            top *= 4
-            right *= 4
-            bottom *= 4
-            left *= 4
-            rects.append([left, top, right, bottom])
-        return rects
+    def detect(self, input_image: np.ndarray):
+        detect_start_timer = time.perf_counter()
+        h, w = input_image.shape[:2]
+        max_size: int = self.options.face_max_size or w
+        resized_w, resized_h = None, None
 
-    def acquire_lock(self):
-        if str2bool(self.disable_locks):
-            return
-        if self.is_locked:
-            g.log.debug(2, f"{lp}portalock: already acquired -> '{self.lock_name}'")
-            return
-        try:
-            g.log.debug(2, f"{lp}portalock: Waiting for '{self.lock_name}'")
-            self.lock.acquire()
-            g.log.debug(2, f"{lp}portalock: acquired -> '{self.lock_name}'")
-            self.is_locked = True
+        if w > max_size:
+            self.downscaled = True
+            logger.debug(f"{LP} scaling image down using {max_size} as width")
+            self.original_image = input_image.copy()
+            from zm_mlapi.utils import resize_cv2_image
 
-        except portalocker.AlreadyLocked:
-            g.log.error(f"{lp}portalock: Timeout waiting for -> '{self.lock_timeout}' sec: {self.lock_name}")
-            raise ValueError(f"portalock: Timeout waiting for {self.lock_timeout} sec: {self.lock_name}")
+            input_image = resize_cv2_image(input_image, max_size)
+            resized_h, resized_w = input_image.shape[:2]
+            self.x_factor = w / resized_w
+            self.y_factor = h / resized_h
 
-    def release_lock(self):
-        if str2bool(self.disable_locks):
-            return
-        if not self.is_locked:
-            # g.logger.debug(2, f"portalock: already released: {self.lock_name}")
-            return
-        self.lock.release()
-        self.is_locked = False
-        g.log.debug(2, f"{lp}portalock: released -> '{self.lock_name}'")
+        logger.debug(
+            f"|---------- D-lib Face Detection"
+            f"{f'(original dimensions {w}*{h}) ' if resized_h else ''}"
+            f"{f'(resized input image: {resized_w}*{resized_h}) ----------|' if resized_h else f'(input image: {w}*{h}) ----------|'}"
+        )
+        # Convert the image from BGR color (which OpenCV uses) to RGB color (which face_recognition uses)
+        rgb_image = cv2.cvtColor(input_image, cv2.COLOR_BGR2RGB)
 
-    @property
-    def get_model_name(self) -> str:
-        return "Face-Dlib"
+        # Find all the faces and face encodings in the target image
+        self.face_locations = face_recognition.face_locations(
+            rgb_image,
+            model=self.options.face_model,
+            number_of_times_to_upsample=self.options.upsample_times,
+        )
+        self.face_encodings = face_recognition.face_encodings(
+            rgb_image,
+            known_face_locations=self.face_locations,
+            num_jitters=self.options.num_jitters,
+            model="small",  # small is default but faster, large is more accurate
+        )
 
-    @property
-    def get_sequence_name(self) -> str:
-        return self.sequence_name
+        logger.debug(
+            f"perf:{LP}{self.processor}: computing locations and encodings took "
+            f"{time.perf_counter() - detect_start_timer:.5f}ms"
+        )
 
-    def detect(self, input_image):
-        # global face_rec_libs
-        detect_start_timer = Timer()
-        Height, Width = input_image.shape[:2]
+        # return self.face_locations, self.face_encodings
 
-        downscaled = False
-        upsize_x_factor = None
-        upsize_y_factor = None
-        max_size = self.options.get("max_size", Width)
-        old_image = None
-        newWidth, newHeight = None, None
-        # g.logger.debug(5, f"{lp} options={self.options}")
 
-        if Width > int(max_size):
-            downscaled = True
-            g.log.debug(2, f"{lp} scaling image down using 'max_size' as width: {max_size}")
-            old_image = input_image.copy()
-            input_image = resize_image(input_image, max_size)
-            newHeight, newWidth = input_image.shape[:2]
-            upsize_x_factor = Width / newWidth
-            upsize_y_factor = Height / newHeight
 
-        g.log.debug(
-            f"|---------- D-lib Face Detection and Recognition "
-            f"{f'(original dimensions {Width}*{Height}) ' if newHeight else ''}"
-            f"{f'(resized input image: {newWidth}*{newHeight}) ----------|' if newHeight else f'(input image: {Width}*{Height}) ----------|'}"
+    # def recognize(self, input_image: np.ndarray):
+        if not self.knn:
+
+            raise RuntimeError("KNN model not loaded!")
+        logger.debug(f"{LP} comparing detected faces to trained faces...")
+        comparing_timer = time.perf_counter()
+        closest_distances = self.knn.kneighbors(self.face_encodings, n_neighbors=1)
+        logger.debug(
+            f"{LP} closest KNN match indexes (smaller is better): {closest_distances}",
+        )
+        are_matches = [
+            closest_distances[0][i][0] <= self.options.recognition_threshold
+            for i in range(len(self.face_locations))
+        ]
+        prediction_labels = self.knn.predict(self.face_encodings)
+        logger.debug(
+            f"{LP} KNN predictions: {prediction_labels} - are_matches: {are_matches}",
+        )
+        logger.debug(
+            f"perf:{LP}{self.processor}: matching detected faces to known faces took "
+            f"{time.perf_counter() - comparing_timer:.5f}ms"
         )
         labels = []
-        classes = []
-        conf = []
-
-        # Convert the image from BGR color (which OpenCV uses) to RGB color (which face_recognition uses)
-        rgb_image = input_image[:, :, ::-1]
-        # rgb_image = image
-        t = Timer()
-        # Find all the faces and face encodings in the target image
-        # g.logger.debug(self.options)
-        if self.options.get("auto_lock", True):
-            self.acquire_lock()
-
-        face_locations = face_recognition.face_locations(
-            rgb_image, model=self.face_model, number_of_times_to_upsample=self.upsample_times
-        )
-
-        diff_time = t.stop_and_get_ms()
-        g.log.debug(f"perf:face:{self.processor}: finding face locations took {diff_time}")
-
-        t = Timer()
-        face_encodings = face_recognition.face_encodings(
-            rgb_image, known_face_locations=face_locations, num_jitters=self.num_jitters
-        )
-
-        if self.options.get("auto_lock", True):
-            self.release_lock()
-
-        diff_time = t.stop_and_get_ms()
-        g.log.debug(f"perf:face:{self.processor}: computing face recognition distances took {diff_time}")
-
-        if not len(face_encodings):
-            return [], [], [], []
-
-        # Use the KNN model to find the best matches for the test face
-
-        g.log.debug(3, f"{lp} comparing detected faces to known faces...")
-
-        t = Timer()
-        if self.knn:
-            # g.logger.debug(5, 'FACE ENCODINGS={}'.format(face_encodings))
-            closest_distances = self.knn.kneighbors(face_encodings, n_neighbors=1)
-            g.log.debug(5, f"{lp} closest knn match indexes (smaller is better): {closest_distances}")
-            are_matches = [
-                closest_distances[0][i][0] <= float(self.options.get("face_recog_dist_threshold", 0.6))
-                for i in range(len(face_locations))
-            ]
-            prediction_labels = self.knn.predict(face_encodings)
-            g.log.debug(5, f"{lp} KNN predictions: {prediction_labels} - are_matches: {are_matches}")
-
-        else:
-            g.log.debug(f"{lp} no faces to match, creating empty set...")
-            # There were no faces to compare
-            # create a set of non matches for each face found
-            are_matches = [False] * len(face_locations)
-            prediction_labels = [""] * len(face_locations)
-
-        diff_time = t.stop_and_get_ms()
-        g.log.debug(f"perf:{lp}{self.processor}: matching detected faces to known faces took {diff_time}")
-        matched_face_names = []
-        matched_face_rects = []
-        if downscaled:
-            g.log.debug(2, f"{lp} scaling image back up to {Width}")
-            input_image = old_image
-            new_face_locations = []
-            for loc in face_locations:
+        bboxs = []
+        if self.downscaled:
+            logger.debug(f"{LP} scaling image back up to original size")
+            input_image = self.original_image
+            scaled_face_locations = []
+            for loc in self.face_locations:
                 a, b, c, d = loc
-                a = round(a * upsize_y_factor)
-                b = round(b * upsize_x_factor)
-                c = round(c * upsize_y_factor)
-                d = round(d * upsize_x_factor)
-                new_face_locations.append((a, b, c, d))
-            face_locations = new_face_locations
+                a = round(a * self.y_factor)
+                b = round(b * self.x_factor)
+                c = round(c * self.y_factor)
+                d = round(d * self.x_factor)
+                scaled_face_locations.append((a, b, c, d))
+            self.face_locations = scaled_face_locations
+            del scaled_face_locations
 
-        for pred, loc, rec in zip(prediction_labels, face_locations, are_matches):
-            label = pred if rec else self.options.get("unknown_face_name", "unknown")
-            if not rec and str2bool(self.options.get("save_unknown_faces")):
-                h, w, c = input_image.shape
-                x1 = max(loc[3] - int(self.options.get("save_unknown_faces_leeway_pixels", 0)), 0)
-                y1 = max(loc[0] - int(self.options.get("save_unknown_faces_leeway_pixels", 0)), 0)
-                x2 = min(loc[1] + int(self.options.get("save_unknown_faces_leeway_pixels", 0)), w)
-                y2 = min(loc[2] + int(self.options.get("save_unknown_faces_leeway_pixels", 0)), h)
-                # print (image)
-                crop_img = input_image[y1:y2, x1:x2]
-                # crop_img = image
-                timestr = time.strftime("%b%d-%Hh%Mm%Ss-")
-                unf = f"{self.options.get('unknown_images_path')}/{timestr}{id_generator()}.jpg"
-                g.log.info(
-                    f"{lp} saving cropped '{self.options.get('unknown_face_name', 'unknown')}' face "
-                    f"at [{x1},{y1},{x2},{y2} - includes leeway of "
-                    f"{self.options.get('save_unknown_faces_leeway_pixels')}px] to {unf}"
+        for pred, loc, rec in zip(prediction_labels, self.face_locations, are_matches):
+            label = pred if rec else self.options.unknown_face_name
+            if not rec and self.options.save_unknown_faces:
+                if Path(self.options.unknown_faces_dir).is_dir() and os.access(
+                    self.options.unknown_faces_dir, os.W_OK
+                ):
+                    time_str = time.strftime("%b%d-%Hh%Mm%Ss-")
+                    import uuid
+
+                    unf = (
+                        f"{self.options.unknown_faces_dir}/{time_str}{uuid.uuid4()}.jpg"
+                    )
+                    h, w = input_image.shape[:2]
+                    leeway = int(self.options.unknown_faces_leeway_pixels)
+                    x1 = max(
+                        loc[3] - leeway,
+                        0,
+                    )
+                    y1 = max(
+                        loc[0] - leeway,
+                        0,
+                    )
+                    x2 = min(
+                        loc[1] + leeway,
+                        w,
+                    )
+                    y2 = min(
+                        loc[2] + leeway,
+                        h,
+                    )
+                    crop_img = input_image[y1:y2, x1:x2]
+                    # crop_img = image
+
+                    logger.info(
+                        f"{LP} saving cropped '{self.options.unknown_face_name}' face "
+                        f"at [{x1},{y1},{x2},{y2} - includes leeway of "
+                        f"{self.options.unknown_faces_leeway_pixels}px] to {unf}"
+                    )
+                    # cv2.imwrite won't throw an exception it outputs a WARN to console
+                    cv2.imwrite(unf, crop_img)
+
+            bboxs.append([loc[3], loc[0], loc[1], loc[2]])
+            labels.append(f"face: {label}")
+
+        logger.debug(
+            f"perf:{LP} recognition sequence took {time.perf_counter() - comparing_timer:.5f}ms"
+        )
+
+        return {
+            "detections": True if labels else False,
+            "type": self.config.model_type,
+            "processor": self.options.processor,
+            "model_name": self.model_name,
+            "label": labels,
+            "confidence": [1] * len(labels),
+            "bounding_box": bboxs,
+        }
+
+    def train(self, face_resize_width: Optional[int] = None):
+        t = time.perf_counter()
+        train_model = self.options.face_train_model
+        knn_algo = "ball_tree"
+        upsample_times = self.options.upsample_times
+        num_jitters = self.options.num_jitters
+
+        ext = (".jpg", ".jpeg", ".png")
+        known_face_encodings = []
+        known_face_names = []
+        try:
+            known_parent_dir = Path(self.options.known_faces_dir)
+            for train_person_dir in known_parent_dir.glob("*"):
+                if train_person_dir.is_dir():
+                    for file in train_person_dir.glob("*"):
+                        if file.suffix.lower() in ext:
+                            logger.info(f"{LP} training on {file}")
+                            known_face_image = cv2.imread(file.as_posix())
+                            # known_face_image = face_recognition.load_image_file(file)
+                            if known_face_image is None or known_face_image.size == 0:
+                                logger.error(f"{LP} Error reading file, skipping")
+                                continue
+                            if not face_resize_width:
+                                face_resize_width = self.options.face_train_max_size
+                            logger.debug(f"{LP} resizing to {face_resize_width}")
+                            from zm_mlapi.utils import resize_cv2_image
+
+                            known_face_image = resize_cv2_image(
+                                known_face_image, face_resize_width
+                            )
+                            known_face_image = cv2.cvtColor(
+                                known_face_image, cv2.COLOR_BGR2RGB
+                            )
+
+                            face_locations = face_recognition.face_locations(
+                                known_face_image,
+                                model=train_model,
+                                number_of_times_to_upsample=upsample_times,
+                            )
+                            if len(face_locations) != 1:
+                                extra_err_msg: str = ""
+                                if self.options.face_train_model == FaceModel.HOG:
+                                    extra_err_msg = (
+                                        "If you think you have only 1 face try using 'cnn' "
+                                        "for training mode. "
+                                    )
+
+                                logger.error(
+                                    f"{LP} Image has {len(face_locations)} faces, cannot use for training. "
+                                    f"We need exactly 1 face. {extra_err_msg}Ignoring..."
+                                )
+                            else:
+                                face_encoding = face_recognition.face_encodings(
+                                    known_face_image,
+                                    known_face_locations=face_locations,
+                                    num_jitters=num_jitters,
+                                )
+                                if face_encoding:
+                                    known_face_encodings.append(face_encoding[0])
+                                    known_face_names.append(train_person_dir.name)
+                                else:
+                                    logger.warning(
+                                        f"{LP} no face found in {file} - skipping"
+                                    )
+                        else:
+                            logger.warning(
+                                f"{LP} image is not in allowed format! skipping {file}"
+                            )
+                else:
+                    logger.warning(
+                        f"{LP} {train_person_dir} is not a directory! skipping"
+                    )
+        except Exception as e:
+            logger.error(f"{LP} Error during recognition training: {e}")
+            raise e
+
+        if not len(known_face_names):
+            logger.warning(
+                f"{LP} No known faces found to train, skipping saving of face encodings to file..."
+            )
+        else:
+            import math
+
+            n_neighbors = int(round(math.sqrt(len(known_face_names))))
+            logger.debug(f"{LP} using algo: {knn_algo} n_neighbors: {n_neighbors}")
+            knn = neighbors.KNeighborsClassifier(
+                n_neighbors=n_neighbors, algorithm=knn_algo, weights="distance"
+            )
+
+            logger.debug(f"{LP} training model ...")
+            knn.fit(known_face_encodings, known_face_names)
+
+            try:
+                with open(self.trained_faces_file, "wb") as f:
+                    pickle.dump(knn, f)
+            except Exception as exc:
+                logger.error(
+                    f"{LP} error pickling face encodings to {self.trained_faces_file} -> {exc}"
                 )
-                # cv2.imwrite wont throw an exception it outputs a WARN to console
-                cv2.imwrite(unf, crop_img)
+            else:
+                logger.debug(f"{LP} wrote KNN encodings to '{self.trained_faces_file}'")
 
-            matched_face_rects.append([loc[3], loc[0], loc[1], loc[2]])
-            matched_face_names.append(label)
-            # matched_face_names.append('face:{}'.format(label))
-            conf.append(1)
-        g.log.debug(f"perf:{lp} total dlib sequence took {detect_start_timer.stop_and_get_ms()} ms")
-        g.log.debug(3, f"{lp} Returning -> {matched_face_rects}, {matched_face_names}, {conf}")
-        return matched_face_rects, matched_face_names, conf, ["face_dlib"] * len(matched_face_names)
+        logger.debug(
+            f"perf:{LP} Recognition training took: {time.perf_counter() - t:.5f}ms"
+        )
