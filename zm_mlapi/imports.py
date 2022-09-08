@@ -1,3 +1,7 @@
+from typing import Dict
+
+import portalocker
+
 from zm_mlapi.schemas import (
     ModelType,
     ModelFrameWork,
@@ -11,5 +15,7 @@ from zm_mlapi.schemas import (
     FaceModelOptions,
     FaceModel,
     ALPRModelOptions,
+    ALPRModelConfig,
+    ALPRService,
+    LockSettings,
 )
-

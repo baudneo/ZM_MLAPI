@@ -1,3 +1,4 @@
+import collections
 import inspect
 import logging
 import sys
@@ -8,6 +9,7 @@ from typing import Union, Optional, Type, Dict
 
 import cv2
 import numpy as np
+import portalocker as portalocker
 import pydantic
 import uvicorn
 from fastapi import (
@@ -23,6 +25,7 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 
 from zm_mlapi.imports import (
+    ModelProcessor,
     Settings,
     GlobalConfig,
     ModelOptions,
@@ -52,16 +55,20 @@ logger.info(
     f"Pydantic: {pydantic.VERSION}]"
 )
 
-app = FastAPI()
+app = FastAPI(debug=True)
 g = GlobalConfig()
+
+
 
 
 # Allow Form() to contain JSON, Nested JSON is not allowed though - Transforms into Query()
 def as_form(cls: Type[BaseModel]):
+    logger.info(f"as_form: {cls}")
     new_parameters = []
 
     for field_name, model_field in cls.__fields__.items():
         model_field: ModelField  # type: ignore
+        logger.info(f"as_form: {field_name} -> {model_field}")
 
         new_parameters.append(
             inspect.Parameter(
@@ -132,6 +139,18 @@ def get_available_model(model_uuid: str) -> MLModelConfig:
         if str(model.id) == model_uuid:
             return model
     raise HTTPException(status_code=404, detail=f"Model {model_uuid} not found")
+
+@app.post("/detector/create", summary="Create a new detector (ML pipeline sequence)")
+async def create_detector(
+    model_uuid: str = Form(...),
+    model_options: Union[ModelOptions, FaceModelOptions, ALPRModelOptions] = Form(
+        ...
+    ),
+    global_config: GlobalConfig = Depends(get_global_config),
+):
+    model = get_available_model(model_uuid)
+    detector = get_detector(model_uuid, model, model_options)
+    return detector
 
 
 # upload an image for inference
@@ -247,18 +266,18 @@ class MLAPI:
     def start_server(self):
         logger.info("running server")
         logger.info(f"{str(get_global_config().available_models[0].id)}")
-        uvicorn_log_config = {
+        """LOGGING_CONFIG: Dict[str, Any] = {
             "version": 1,
-            "disable_existing_loggers": True,
+            "disable_existing_loggers": False,
             "formatters": {
                 "default": {
                     "()": "uvicorn.logging.DefaultFormatter",
-                    "fmt": "%(asctime)s.%(msecs)04d %(name)s[%(process)s] %(levelname)s %(module)s:%(lineno)d->[%(message)s]",
+                    "fmt": "%(levelprefix)s %(message)s",
                     "use_colors": None,
                 },
                 "access": {
                     "()": "uvicorn.logging.AccessFormatter",
-                    "fmt": '%(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s',
+                    "fmt": '%(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s',  # noqa: E501
                 },
             },
             "handlers": {
@@ -274,29 +293,26 @@ class MLAPI:
                 },
             },
             "loggers": {
-                "uvicorn": {"handlers": ["default"], "level": "DEBUG"},
-                "uvicorn.error": {
-                    "level": "DEBUG",
-                    "handlers": ["default"],
-                    "propagate": True,
-                },
-                "uvicorn.access": {
-                    "handlers": ["access"],
-                    "level": "DEBUG",
-                    "propagate": False,
-                },
-                "zm_mlapi": {"handlers": ["default"], "level": "DEBUG"},
+                "uvicorn": {"handlers": ["default"], "level": "INFO"},
+                "uvicorn.error": {"level": "INFO"},
+                "uvicorn.access": {"handlers": ["access"], "level": "INFO", "propagate": False},
             },
         }
-        uvicorn.LOGGING_CONFIG = uvicorn_log_config
+        """
+        uvicorn.config.LOGGING_CONFIG["formatters"]["default"]["fmt"] = "%(asctime)s.%(msecs)04d %(name)s[%(process)s] %(levelname)s %(module)s:%(lineno)d -> %(message)s"
+        uvicorn.config.LOGGING_CONFIG["formatters"]["default"]["use_colors"] = True
+        uvicorn.config.LOGGING_CONFIG["handlers"]["default"]["level"] = "DEBUG"
+        uvicorn.config.LOGGING_CONFIG["loggers"]["uvicorn"]["level"] = "DEBUG"
+        uvicorn.config.LOGGING_CONFIG["loggers"]["uvicorn.error"]["level"] = "DEBUG"
         config = uvicorn.Config(
             "zm_mlapi.app:app",
             host=self.cached_settings.host,
             port=self.cached_settings.port,
             reload=self.cached_settings.reload,
             debug=self.cached_settings.debug,
-            # log_config=uvicorn_log_config,
+            log_config=uvicorn.config.LOGGING_CONFIG,
             log_level="debug",
+            proxy_headers=True,
         )
         lifetime = time.perf_counter()
         self.server = uvicorn.Server(config)

@@ -1,4 +1,5 @@
 import logging
+import tempfile
 import uuid
 from dataclasses import dataclass
 from enum import Enum
@@ -6,6 +7,7 @@ from pathlib import Path
 from typing import Union, List, Dict, Optional, IO, Any
 
 import numpy as np
+import portalocker
 from fastapi import UploadFile, File, Form
 from pydantic import BaseModel, Field, validator, BaseSettings
 from pydantic.fields import ModelField
@@ -298,69 +300,16 @@ class MLModelConfig(BaseModel):
         return v
 
 
-class ModelSequence(BaseModel):
-    based_on: uuid.UUID = Field(
-        ..., description="UUID of the available model to base the sequence on"
-    )
-    __source_model__: MLModelConfig = Field(
-        None, description="The source model", repr=False, exclude=True
-    )
+class ALPRService(str, Enum):
+    LOCAL = "local"
+    CLOUD = "cloud"
+    DEFAULT = LOCAL
 
-    id: int = Field(
-        ...,
-        description="Unique ID of the model sequence (duplicates will be overwritten)",
-    )
-    name: str = Field(
-        None, description="Name that will be shown in the annotated frame"
-    )
-    enabled: bool = Field(True, description="Enable/Disable the model")
-    framework: ModelFrameWork = Field(
-        ModelFrameWork.OPENCV, description="model framework"
-    )
-    processor: ModelProcessor = Field(
-        ModelProcessor.CPU, description="Processor used for this model"
-    )
-    # Model input size (image will be resized if needed)
-    height: int = Field(
-        416, description="model input height (resized before inference)"
-    )
-    width: int = Field(416, description="model input width (resized before inference)")
-    fp_16: bool = Field(
-        False, description="Floating Point 16 target (OpenCV - CUDA/cuDNN[GPU] only)"
-    )
-    square_image: bool = Field(
-        False, description="square image by zero padding (if needed)"
-    )
 
-    @validator("based_on", always=True, pre=True)
-    def _validate_based_on(
-        cls, v, values, field: ModelField
-    ) -> Optional[MLModelConfig]:
-        from zm_mlapi.app import get_global_config
-
-        g = get_global_config()
-        logger.debug(f"validating {field.name} - {v = } -- {type(v) = } -- {values = }")
-        if not v:
-            raise ValueError(f"{field.name} is required")
-        if not isinstance(v, uuid.UUID):
-            raise ValueError(f"{field.name} must be a UUID")
-        if not (model := g.available_models.get(v)):
-            raise ValueError(f"{field.name} must be a valid UUID of an existing model")
-        values["_source_model_data"] = model
-        return v
-
-    @validator("fp_16")
-    def check_fp_16(cls, v, values):
-        if (
-            values["framework"] != ModelFrameWork.OPENCV
-            and values["processor"] != ModelProcessor.GPU
-        ):
-            logger.warning(
-                f"fp_16 is not supported for {values['framework']} and {values['processor']}. "
-                f"Only OpenCV->GPU is supported."
-            )
-            v = False
-        return v
+class ALPRModelConfig(MLModelConfig):
+    alpr_key: str = Field(None, description="ALPR Cloud API Key")
+    alpr_service: ALPRService = Field(ALPRService.LOCAL, description="ALPR Service Type")
+    alpr_url: str = Field(None, description="ALPR Cloud API URL")
 
 
 class ModelConfigFromFile:
@@ -464,14 +413,83 @@ class ModelConfigFromFile:
         return cfg
 
 
+class LockSetting(BaseModel):
+    max: int = Field(1, description="Maximum number of parallel processes")
+    timeout: int = Field(30, description="Timeout in seconds for acquiring a lock")
+
+
+class LockSettings(BaseModel):
+    lock_dir: str = Field(f"{tempfile.gettempdir()}/zm_mlapi/locks", description="Directory for lock files (Default is Systems temporary directory)")
+    gpu: LockSetting = Field(default_factory=LockSetting, description="GPU Lock Settings")
+    cpu: LockSetting = Field(default_factory=LockSetting, description="CPU Lock Settings")
+    tpu: LockSetting = Field(default_factory=LockSetting, description="TPU Lock Settings")
+
+
+class MLLocks:
+    locks: Dict[str, portalocker.BoundedSemaphore] = {}
+
+    def __next__(self):
+        return next(self.locks.__iter__())
+
+    def __contains__(self, processor: str) -> bool:
+        return processor in self.locks
+
+    def __get__(self, instance, owner):
+        return self.locks
+
+    def __set__(self, instance, value):
+        raise SyntaxError("Cannot set locks")
+
+    def __getitem__(self, processor: str) -> portalocker.BoundedSemaphore:
+        return self.get_lock(processor)
+
+    def __iter__(self):
+        return iter(self.locks)
+
+    def __len__(self):
+        return len(self.locks)
+
+    def __repr__(self):
+        return f"MLLocks({self.locks})"
+
+    def __str__(self):
+        return f"MLLocks({self.locks})"
+
+    def __init__(self, locks: LockSettings):
+        self.locks = {
+            "gpu": portalocker.BoundedSemaphore(
+                locks.gpu.max,
+                directory=locks.lock_dir,
+                name="zm_mlapi-gpu",
+                timeout=locks.gpu.timeout,
+            ),
+            "cpu": portalocker.BoundedSemaphore(
+                locks.cpu.max,
+                directory=locks.lock_dir,
+                name="zm_mlapi-cpu",
+                timeout=locks.cpu.timeout,
+            ),
+            "tpu": portalocker.BoundedSemaphore(
+                locks.tpu.max,
+                directory=locks.lock_dir,
+                name="zm_mlapi-tpu",
+                timeout=locks.tpu.timeout,
+            ),
+        }
+
+    def get_lock(self, processor: str) -> portalocker.BoundedSemaphore:
+        if processor in self.locks:
+            return self.locks[processor]
+        raise SyntaxError(f"Invalid processor: {processor}")
+
+
 class Settings(BaseSettings):
-    from tempfile import gettempdir
 
     model_config: Path = Field(
         ..., description="Path to the model configuration YAML file"
     )
     log_dir: Path = Field(
-        default=f"{gettempdir()}/zm_mlapi/logs", description="Logs directory"
+        default=f"{tempfile.gettempdir()}/zm_mlapi/logs", description="Logs directory"
     )
     host: str = Field(default="0.0.0.0", description="Interface IP to listen on")
     port: int = Field(default=5000, description="Port to listen on")
@@ -485,9 +503,23 @@ class Settings(BaseSettings):
     debug: bool = Field(default=False, description="Debug mode - For development only")
 
     models: ModelConfigFromFile = Field(
-        None, description="ModelConfig object", exclude=True
+        None, description="ModelConfig object", exclude=True, repr=False
     )
     available_models: List[MLModelConfig] = Field(None, description="Available models")
+    locks: LockSettings = Field(default_factory=LockSettings, description="Lock Settings", repr=False)
+
+    ml_locks: MLLocks = Field(None, description="ML Locks class")
+
+    class Config:
+        env_nested_delimiter = '__'
+
+    @validator("ml_locks")
+    def ml_locks_validator(cls, v, values):
+        locks = values.get("locks")
+        if locks:
+            v = MLLocks(values["locks"])
+        logger.info(f"Settings._ml_locks_validator: {locks = }")
+        return v
 
     @validator("available_models")
     def validate_available_models(cls, v, values):
@@ -692,3 +724,35 @@ class GlobalConfig(BaseModel):
 
     class Config:
         arbitrary_types_allowed = True
+
+
+class MLSequence(BaseModel):
+    """ML Sequence class, used to sequence multiple detectors"""
+    id: int = Field(default=0, description="Sequence ID")
+
+    name: str = Field(
+        default="default", description="Name of the sequence, used for logging"
+    )
+    detectors: List[APIDetector] = Field(
+        default_factory=list, description="Detectors to run in sequence"
+    )
+    class Config:
+        arbitrary_types_allowed = True
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}({self.name} <--> Detectors: {self.detectors})"
+
+    def detect(self, image: np.ndarray) -> Dict[str, Any]:
+        """Detect objects in the image using threads"""
+        from concurrent.futures import ThreadPoolExecutor
+        threads = []
+        results = {}
+        for detector in self.detectors:
+            threads.append(
+                ThreadPoolExecutor(max_workers=10).submit(detector.detect, image=image)
+            )
+
+        for thread in threads:
+
+            results.update(thread.result(timeout=10))
+        return results

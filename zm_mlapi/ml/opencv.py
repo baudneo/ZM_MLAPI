@@ -51,8 +51,6 @@ class OpenCVDetector:
         logger.debug(f"{LP} configuration: {self.config}")
         logger.debug(f"{LP} options: {self.options}")
 
-
-
     @property
     def options(self):
         return self._options
