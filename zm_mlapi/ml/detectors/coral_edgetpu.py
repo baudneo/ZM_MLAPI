@@ -11,8 +11,8 @@ from zm_mlapi.imports import (
     ModelProcessor,
     BaseModelOptions,
     BaseModelConfig,
-    FaceRecognitionLibModelOptions,
-    OpenALPRLocalModelOptions,
+    TPUModelConfig,
+
 )
 from zm_mlapi.ml.file_locks import FileLock
 from zm_mlapi.schemas import ModelType
@@ -27,10 +27,8 @@ make_interpreter = None
 
 
 class TpuDetector(FileLock):
-    def __init__(self, model_config: BaseModelConfig):
+    def __init__(self, model_config: TPUModelConfig):
         global LP, common, detect, make_interpreter
-        if not model_config:
-            raise ValueError(f"{LP} no config passed!")
         try:
             from pycoral.adapters import common as common, detect as detect
             from pycoral.utils.edgetpu import make_interpreter as make_interpreter
@@ -44,11 +42,9 @@ class TpuDetector(FileLock):
         else:
             logger.debug(f"{LP} the pycoral library has been successfully imported, initializing...")
         # Model init params
-        self.config: BaseModelConfig = model_config
-        self.options: Union[
-            BaseModelOptions, FaceRecognitionLibModelOptions, OpenALPRLocalModelOptions
-        ] = self.config.detection_options
-        self.processor: ModelProcessor = self.config.processor
+        self.config = model_config
+        self.options = self.config.detection_options
+        self.processor = self.config.processor
         self.name = self.config.name
         self.model = None
         if self.config.model_type == ModelType.FACE:
@@ -76,7 +72,7 @@ class TpuDetector(FileLock):
             logger.debug(f"perf:{LP} loading took: {time.perf_counter() - t:.5f}s")
 
     def detect(self, input_image: np.ndarray):
-        detect_msg: str = ""
+        b_boxes, labels, confs = [], [], []
         h, w = input_image.shape[:2]
         _h, _w = self.config.height, self.config.width
         if not self.model:
@@ -118,10 +114,8 @@ class TpuDetector(FileLock):
         finally:
             self.release_lock()
 
-        bbox, labels, conf = [], [], []
-
         for obj in objs:
-            bbox.append(
+            b_boxes.append(
                 [
                     int(round(obj.bbox.xmin)),
                     int(round(obj.bbox.ymin)),
@@ -130,7 +124,7 @@ class TpuDetector(FileLock):
                 ]
             )
             labels.append(self.config.labels[obj.id])
-            conf.append(float(obj.score))
+            confs.append(float(obj.score))
 
         if model_resize and labels:
             logger.debug(
@@ -138,7 +132,7 @@ class TpuDetector(FileLock):
                 f"bounding boxes in image by factors of -> x={x_factor:.4} "
                 f"y={y_factor:.4}",
             )
-            for box in bbox:
+            for box in b_boxes:
                 box[0] = round(box[0] * x_factor)
                 box[1] = round(box[1] * y_factor)
                 box[2] = round(box[2] * x_factor)
@@ -150,6 +144,6 @@ class TpuDetector(FileLock):
             "processor": self.processor,
             "model_name": self.name,
             "label": labels,
-            "confidence": conf,
-            "bounding_box": bbox,
+            "confidence": confs,
+            "bounding_box": b_boxes,
         }

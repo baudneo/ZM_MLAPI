@@ -86,6 +86,8 @@ class ModelFrameWork(str, Enum):
     ALPR = "alpr"
     FACE_RECOGNITION = "face_recognition"
     DEFAULT = CV_YOLO
+    REKOGNITION = "rekognition"
+    AWS = REKOGNITION
 
 
 class ModelProcessor(str, Enum):
@@ -216,7 +218,8 @@ class PlateRecognizerModelOptions(BaseModelOptions):
     regions: List[str] = Field(
         None,
         example=["us", "cn", "kr", "ca"],
-        description="List of regions to search for plates in. If not specified, all regions are searched. See http://docs.platerecognizer.com/#regions-supported",
+        description="List of regions to search for plates in. If not specified, "
+                    "all regions are searched. See http://docs.platerecognizer.com/#regions-supported",
     )
     # minimal confidence for actually detecting a plate (Just a license plate, not the actual license plate text)
     min_dscore: float = Field(
@@ -286,6 +289,75 @@ class BaseModelConfig(BaseModel):
         return v
 
 
+class TPUModelConfig(BaseModelConfig):
+    input: Path = Field(None, description="model file/dir path (Optional)")
+    classes: Path = Field(default=None, description="model labels file path (Optional)")
+    config: Path = Field(default=None, description="model config file path (Optional)")
+    height: Optional[int] = Field(
+        416, ge=1, description="Model input height (resized for model)"
+    )
+    width: Optional[int] = Field(
+        416, ge=1, description="Model input width (resized for model)"
+    )
+    square: Optional[bool] = Field(
+        False, description="Zero pad the image to be a square"
+    )
+
+    labels: List[str] = Field(
+        default=COCO17,
+        description="model labels parsed into a list of strings",
+        repr=False,
+        exclude=True,
+    )
+
+    @validator("config", "input", "classes", pre=True, always=True)
+    def str_to_path(cls, v, values, field: ModelField) -> Optional[Path]:
+        # logger.debug(f"validating {field.name} - {v = } -- {type(v) = } -- {values = }")
+        msg = f"{field.name} must be a path or a string of a path"
+        model_name = values.get("name", "Unknown Model")
+        lp = f"Model Name: {model_name} ->"
+
+        if v is None:
+            # logger.debug(f"{lp} {field.name} is None, passing as it is Optional")
+            return v
+        elif not isinstance(v, (Path, str)):
+            raise ValueError(msg)
+        elif isinstance(v, str):
+            v = Path(v)
+        if field.name == "config":
+            if values["input"].suffix == ".weights":
+                msg = f"'{field.name}' is required when 'input' is a DarkNet .weights file"
+        return v
+
+    @validator("labels", always=True)
+    def _validate_labels(cls, v, values, field: ModelField) -> Optional[List[str]]:
+        # logger.debug(f"validating {field.name} - {v = } -- {type(v) = } -- {values = }")
+        model_name = values.get("name", "Unknown Model")
+        lp = f"Model Name: {model_name} ->"
+        if not v:
+            if not (labels_file := values["classes"]):
+                logger.debug(
+                    f"{lp} 'classes' is not defined. Using *default* COCO 2017 class labels"
+                )
+                from zm_mlapi.ml.coco17_cv2 import COCO17
+
+                v = COCO17
+            else:
+                logger.debug(
+                    f"'classes' is defined. Parsing '{labels_file}' into a list of strings for class identification"
+                )
+                assert isinstance(
+                    labels_file, Path
+                ), f"{field.name} is not a Path object"
+                assert labels_file.exists(), "labels_file does not exist"
+                assert labels_file.is_file(), "labels_file is not a file"
+                with labels_file.open(mode="r") as f:
+                    f: IO
+                    v = f.read().splitlines()
+        assert isinstance(v, list), f"{field.name} is not a list"
+        return v
+
+
 class CV2YOLOModelConfig(BaseModelConfig):
     input: Path = Field(None, description="model file/dir path (Optional)")
     classes: Path = Field(default=None, description="model labels file path (Optional)")
@@ -315,7 +387,6 @@ class CV2YOLOModelConfig(BaseModelConfig):
         # logger.debug(f"validating {field.name} - {v = } -- {type(v) = } -- {values = }")
         msg = f"{field.name} must be a path or a string of a path"
         model_name = values.get("name", "Unknown Model")
-        lp = f"Model Name: {model_name} ->"
 
         if v is None:
             # logger.debug(f"{lp} {field.name} is None, passing as it is Optional")
@@ -410,11 +481,19 @@ class ALPRModelConfig(BaseModelConfig):
     api_url: str = Field(None, description="ALPR API URL (Cloud/Local)")
 
 
-class HOGModelConfig(BaseModelConfig):
+class CV2HOGModelConfig(BaseModelConfig):
     stride: str = None
     padding: str = None
     scale: float = None
     mean_shift: bool = False
+
+
+class RekognitionModelConfig(BaseModelConfig):
+    aws_access_key_id: str = None
+    aws_secret_access_key: str = None
+    # aws_session_token: str = None
+    # aws_profile: str = None
+    region_name: str = None
 
 
 class DeepFaceModelConfig(BaseModelConfig):
@@ -422,7 +501,82 @@ class DeepFaceModelConfig(BaseModelConfig):
 
 
 class CV2TFModelConfig(BaseModelConfig):
-    pass
+    input: Path = Field(
+        None,
+        description="model file/dir path (Optional)",
+        example="/opt/models/frozen_inference_graph.pb",
+    )
+    classes: Path = Field(default=None, description="model labels file path (Optional)")
+    config: Path = Field(
+        default=None,
+        description="model config file path (Optional)",
+        example="/opt/models/ssd_inception_v2_coco_2017_11_17.pbtxt",
+    )
+    height: Optional[int] = Field(
+        416, ge=1, description="Model input height (resized for model)"
+    )
+    width: Optional[int] = Field(
+        416, ge=1, description="Model input width (resized for model)"
+    )
+    square: Optional[bool] = Field(
+        False, description="Zero pad the image to be a square"
+    )
+    cv2_cuda_fp_16: Optional[bool] = Field(
+        False,
+        description="model uses Floating Point 16 Backend for GPU (EXPERIMENTAL!)",
+    )
+
+    labels: List[str] = Field(
+        default=COCO17,
+        description="model labels parsed into a list of strings",
+        repr=False,
+        exclude=True,
+    )
+
+    @validator("config", "input", "classes", pre=True, always=True)
+    def str_to_path(cls, v, values, field: ModelField) -> Optional[Path]:
+        # logger.debug(f"validating {field.name} - {v = } -- {type(v) = } -- {values = }")
+        msg = f"{field.name} must be a path or a string of a path"
+        model_name = values.get("name", "Unknown Model")
+        if v is None:
+            # logger.debug(f"{lp} {field.name} is None, passing as it is Optional")
+            return v
+        elif not isinstance(v, (Path, str)):
+            raise ValueError(msg)
+        elif isinstance(v, str):
+            v = Path(v)
+        if field.name == "config":
+            if values["input"].suffix == ".weights":
+                msg = f"'{field.name}' is required when 'input' is a DarkNet .weights file"
+        return v
+
+    @validator("labels", always=True)
+    def _validate_labels(cls, v, values, field: ModelField) -> Optional[List[str]]:
+        # logger.debug(f"validating {field.name} - {v = } -- {type(v) = } -- {values = }")
+        model_name = values.get("name", "Unknown Model")
+        lp = f"Model Name: {model_name} ->"
+        if not v:
+            if not (labels_file := values["classes"]):
+                logger.debug(
+                    f"{lp} 'classes' is not defined. Using *default* COCO 2017 class labels"
+                )
+                from zm_mlapi.ml.coco17_cv2 import COCO17
+
+                v = COCO17
+            else:
+                logger.debug(
+                    f"'classes' is defined. Parsing '{labels_file}' into a list of strings for class identification"
+                )
+                assert isinstance(
+                    labels_file, Path
+                ), f"{field.name} is not a Path object"
+                assert labels_file.exists(), "labels_file does not exist"
+                assert labels_file.is_file(), "labels_file is not a file"
+                with labels_file.open(mode="r") as f:
+                    f: IO
+                    v = f.read().splitlines()
+        assert isinstance(v, list), f"{field.name} is not a list"
+        return v
 
 
 class PyTorchModelConfig(BaseModelConfig):
@@ -606,7 +760,9 @@ class Settings(BaseSettings):
     models: ModelConfigFromFile = Field(
         None, description="ModelConfig object", exclude=True, repr=False
     )
-    available_models: List[BaseModelConfig] = Field(None, description="Available models")
+    available_models: List[BaseModelConfig] = Field(
+        None, description="Available models"
+    )
     disable_locks: bool = Field(False, description="Disable file locking")
     lock_settings: LockSettings = Field(
         default_factory=LockSettings, description="Lock Settings", repr=False
@@ -630,16 +786,27 @@ class Settings(BaseSettings):
                     _framework = model.get("framework", "yolo")
                     _options = model.get("detection_options", {})
                     _type = model.get("model_type", "object")
-                    logger.debug(f"DBG<<< {_framework} FRAMEWORK RAW options are {_options}")
+                    logger.debug(
+                        f"DBG<<< {_framework} FRAMEWORK RAW options are {_options}"
+                    )
+                    if _framework == ModelFrameWork.REKOGNITION:
+                        model["model_type"] = ModelType.OBJECT
+                        model["processor"] = None
+                        v.append(RekognitionModelConfig(**model))
+
                     if _framework == ModelFrameWork.FACE_RECOGNITION:
                         model["model_type"] = ModelType.FACE
-                        model["detection_options"] = FaceRecognitionLibModelOptions(**_options)
+                        model["detection_options"] = FaceRecognitionLibModelOptions(
+                            **_options
+                        )
                         v.append(FaceRecognitionLibModelConfig(**model))
                     elif _framework == ModelFrameWork.ALPR:
                         model["model_type"] = ModelType.ALPR
                         api_type = model.get("api_type", "local")
                         api_service = model.get("service", "openalpr")
-                        logger.debug(f"DEBUG>>> FrameWork: {_framework}  Service: {api_service} [{api_type}]")
+                        logger.debug(
+                            f"DEBUG>>> FrameWork: {_framework}  Service: {api_service} [{api_type}]"
+                        )
                         config = ALPRModelConfig(**model)
                         if api_service == ALPRService.OPENALPR:
                             if api_type == ALPRAPIType.LOCAL:
@@ -738,7 +905,7 @@ class APIDetector:
         PlateRecognizerModelOptions,
         ALPRModelOptions,
         FaceRecognitionLibModelOptions,
-        CV2YOLOModelOptions
+        CV2YOLOModelOptions,
     ]
 
     def __repr__(self):
@@ -821,9 +988,15 @@ class APIDetector:
             from zm_mlapi.ml.detectors.face_recognition import (
                 FaceRecognitionLibDetector,
             )
+
             self.model = FaceRecognitionLibDetector(self.config)
         elif self.config.framework == ModelFrameWork.ALPR:
-            from zm_mlapi.ml.detectors.alpr import OpenAlprCmdLine, OpenAlprCloud, PlateRecognizer
+            from zm_mlapi.ml.detectors.alpr import (
+                OpenAlprCmdLine,
+                OpenAlprCloud,
+                PlateRecognizer,
+            )
+
             if self.config.service == ALPRService.PLATE_RECOGNIZER:
                 self.model = PlateRecognizer(self.config)
             elif self.config.service == ALPRService.OPENALPR:
@@ -841,7 +1014,7 @@ class APIDetector:
         available = False
         processor = self.config.processor
         framework = self.config.framework
-        if framework == ModelFrameWork.ALPR:
+        if framework == ModelFrameWork.ALPR or framework == ModelFrameWork.REKOGNITION:
             available = True
         elif not processor:
             available = True
@@ -955,9 +1128,7 @@ class GlobalConfig(BaseModel):
             if detector.config.id == model.id:
                 ret_ = detector
         if not ret_:
-            logger.debug(
-                f"Creating new detector for '{model.name}'"
-            )
+            logger.debug(f"Creating new detector for '{model.name}'")
             ret_ = APIDetector(model)
             self.detectors.append(ret_)
         if not ret_:

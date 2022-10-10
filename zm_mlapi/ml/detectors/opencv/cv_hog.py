@@ -1,15 +1,15 @@
 from logging import getLogger
 
-from zm_mlapi.imports import HOGModelConfig
+from zm_mlapi.imports import CV2HOGModelConfig
 from zm_mlapi.imports import cv2
-from zm_mlapi.ml.detectors.opencv.cvbase import CV2Base
+from zm_mlapi.ml.detectors.opencv.cv_base import CV2Base
 
 LP: str = "OpenCV:HOG:"
 logger = getLogger("zm_mlapi")
 
 
 class CV2HOG(CV2Base):
-    def __init__(self, model_config: HOGModelConfig):
+    def __init__(self, model_config: CV2HOGModelConfig):
         self.config = model_config
         self.options = self.config.detection_options
         self.model = cv2.HOGDescriptor()

@@ -4,7 +4,7 @@ from typing import Optional
 
 
 from zm_mlapi.imports import ModelProcessor, BaseModelOptions, BaseModelConfig, cv2, np, CV2YOLOModelConfig
-from zm_mlapi.ml.detectors.opencv.cvbase import CV2Base
+from zm_mlapi.ml.detectors.opencv.cv_base import CV2Base
 
 LP: str = "OpenCV:YOLO:"
 logger = getLogger("zm_mlapi")
@@ -13,8 +13,6 @@ logger = getLogger("zm_mlapi")
 class CV2YOLODetector(CV2Base):
     def __init__(self, model_config: CV2YOLOModelConfig):
         super().__init__(model_config)
-        if not model_config:
-            raise ValueError(f"{LP} no config passed!")
         # Model init params not initialized in super()
         self.model: Optional[cv2.dnn.DetectionModel] = None
         # logger.debug(f"{LP} configuration: {self.config}")
@@ -67,7 +65,7 @@ class CV2YOLODetector(CV2Base):
             input_image = self.square_image(input_image)
         h, w = input_image.shape[:2]
         # dnn.DetectionModel resizes the image and calculates scale of bounding boxes for us
-        classes, confs, boxes = [], [], []
+        labels, confs, b_boxes = [], [], []
         nms_threshold, conf_threshold = self.options.nms, self.options.confidence
 
         logger.debug(
@@ -96,7 +94,7 @@ class CV2YOLODetector(CV2Base):
                         int(round(box[2])),
                         int(round(box[3])),
                     )
-                    boxes.append(
+                    b_boxes.append(
                         [
                             x,
                             y,
@@ -104,7 +102,7 @@ class CV2YOLODetector(CV2Base):
                             y + _h,
                         ]
                     )
-                    classes.append(self.config.labels[class_id])
+                    labels.append(self.config.labels[class_id])
                     confs.append(confidence)
         except Exception as all_ex:
             err_msg = repr(all_ex)
@@ -127,11 +125,11 @@ class CV2YOLODetector(CV2Base):
         finally:
             self.release_lock()
         return {
-            "detections": True if classes else False,
+            "detections": True if labels else False,
             "type": self.config.model_type,
             "processor": self.processor,
             "model_name": self.name,
-            "label": classes,
+            "label": labels,
             "confidence": confs,
-            "bounding_box": boxes,
+            "bounding_box": b_boxes,
         }

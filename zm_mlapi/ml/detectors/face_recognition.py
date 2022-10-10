@@ -147,7 +147,7 @@ class FaceRecognitionLibDetector(FileLock):
         h, w = input_image.shape[:2]
         max_size: int = self.options.max_size or w
         resized_w, resized_h = None, None
-        labels, bboxs = [], []
+        labels, b_boxes = [], []
 
         if w > max_size:
             self.scaled = True
@@ -205,7 +205,7 @@ class FaceRecognitionLibDetector(FileLock):
                     # image is the originally supplied image, not the resized one to crop if needed
                     if self.config.save_unknown_faces:
                         self.save_unknown_faces(loc, input_image)
-                    bboxs.append([loc[3], loc[0], loc[1], loc[2]])
+                    b_boxes.append([loc[3], loc[0], loc[1], loc[2]])
                     labels.append(f"face: {label}")
 
             else:
@@ -237,7 +237,7 @@ class FaceRecognitionLibDetector(FileLock):
                     if not rec and self.config.save_unknown_faces:
                         self.save_unknown_faces(loc, input_image)
 
-                    bboxs.append([loc[3], loc[0], loc[1], loc[2]])
+                    b_boxes.append([loc[3], loc[0], loc[1], loc[2]])
                     labels.append(f"face: {label}")
                 logger.debug(
                     f"perf:{LP} recognition sequence took {time.perf_counter() - comparing_timer:.5f}ms"
@@ -249,8 +249,8 @@ class FaceRecognitionLibDetector(FileLock):
             "processor": self.processor,
             "model_name": self.name,
             "label": labels,
-            "confidence": [1] * len(labels),
-            "bounding_box": bboxs,
+            "confidence": [1] * len(labels) if labels else [],
+            "bounding_box": b_boxes,
         }
 
     @staticmethod

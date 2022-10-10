@@ -1,11 +1,7 @@
-import time
 from logging import getLogger
-from typing import Optional
+from typing import Optional, Union
 
-from portalocker import BoundedSemaphore, AlreadyLocked
-
-from zm_mlapi.app import locks_enabled, get_global_config
-from zm_mlapi.imports import ModelProcessor, BaseModelOptions, BaseModelConfig
+from zm_mlapi.imports import ModelProcessor, BaseModelOptions, BaseModelConfig, CV2YOLOModelConfig, CV2YOLOModelOptions, CV2TFModelConfig, CV2TFModelOptions, CV2HOGModelConfig
 
 import cv2
 import numpy as np
@@ -17,7 +13,7 @@ LP: str = "OpenCV DNN:"
 
 
 class CV2Base(FileLock):
-    def __init__(self, model_config: BaseModelConfig):
+    def __init__(self, model_config: Union[CV2YOLOModelConfig, CV2TFModelConfig, CV2HOGModelConfig]):
         self.lock_name = ""
         self.lock_maximum = 0
         self.lock_dir = ""
@@ -25,17 +21,13 @@ class CV2Base(FileLock):
         if not model_config:
             raise ValueError(f"{LP} no config passed!")
         # Model init params
-        self.config: BaseModelConfig = model_config
-        self.options: BaseModelOptions = self.config.detection_options
+        self.config = model_config
+        self.options: Union[CV2YOLOModelOptions, CV2TFModelOptions, BaseModelOptions] = self.config.detection_options
         self.processor: ModelProcessor = self.config.processor
         self.name = self.config.name
         self.net: Optional[cv2.dnn] = None
         self.model = None
         self.id = self.config.id
-        self.lock: Optional[BoundedSemaphore] = None
-        self.is_locked = False
-
-
 
     @staticmethod
     def square_image(frame: np.ndarray):

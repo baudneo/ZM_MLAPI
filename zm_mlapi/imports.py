@@ -22,7 +22,9 @@ from zm_mlapi.schemas import (
     DeepFaceModelConfig,
     CV2TFModelConfig,
     PyTorchModelConfig,
-    HOGModelConfig,
+    CV2HOGModelConfig,
+    RekognitionModelConfig,
+    TPUModelConfig,
 
 
     BaseModelOptions,

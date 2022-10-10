@@ -1,0 +1,154 @@
+# This is the available models on disk. Use absolute paths!
+# Add the model name and the path to the model input, config and classes files
+
+# Supports BASH like substitutions; ${sub}
+model_dir: "/home/baudneo/zm_mlapi/models"  # this is a substitution var
+
+models:
+    # An example of a OpenCV YOLO model...
+    - name: YOLOv4  # REQUIRED
+      enabled: true  # Optional. Defaults to True.
+      description: "yolov4 pretrained DarkNet model"  # Optional.
+      framework: yolo  # Optional. Defaults to yolo.
+      model_type: object # Optional. Defaults to object - object/face/alpr (for identification).
+      processor: cpu  # Optional. Defaults to cpu - cpu/gpu/tpu.
+
+      input: "${model_dir}/yolov4/yolov4.weights"  # Required if yolo framework.
+      config: "${model_dir}/yolov4/yolov4.cfg"  # Optional (.weights requires .cfg, .onnx and .tflite does not).
+      classes: "${model_dir}/coco.names"  # Optional. Default is COCO 2017 classes.
+
+      # Image will be resized to these dimensions before being passed to the model
+      height: 512  # Optional. Defaults to 416.
+      width: 512  # Optional. Defaults to 416.
+      # Square the image by zero-padding the shorter side to the longer side before resize
+      square: false  # Optional. Defaults to False.
+      # EXPERIMENTAL!  - Only for OpenCV CUDA YOLO models - half precision FP16 target
+      cuda_fp_16: false  # Optional. Defaults to False.
+
+      detection_options:
+        # The model will only return detections with a confidence score higher than this
+        confidence: 0.2  # Optional. Defaults to 0.2.
+        # Non Max Suppression threshold. Higher values will remove more overlapping boxes
+        nms: 0.4  # Optional. Defaults to 0.4.
+
+    - name: YOLOv4-P6
+      input: "${model_dir}/yolov4/yolov4-p6.weights"
+      config: "${model_dir}/yolov4/yolov4-p6.cfg"
+      description: "Scaled YOLO v4-P6 pretrained DarkNet 1280x1280"
+      height: 1280
+      width: 1280
+
+    - name: yolov7 tiny
+      description: "yolov7 tiny DarkNet model"
+      input: "${model_dir}/yolov7/yolov7-tiny.weights"
+      config: "${model_dir}/yolov7/yolov7-tiny_darknet.cfg"
+      square: yes
+
+
+    - name: dlib face
+      description: "dlib face model"
+      model_type: face
+      framework: face_recognition
+
+      detection_model: cnn
+      training_model: cnn
+      train_max_size: 500
+      unknown_face_name: "Unknown"
+      unknown_faces_leeway_pixels: 10
+      unknown_faces_dir: "/home/baudneo/zm_mlapi/unknown_faces"
+      known_faces_dir: "/home/baudneo/zm_mlapi/known_faces"
+
+      detection_options:
+        confidence: 0.5
+        upsample_times: 1
+        num_jitters: 1
+        max_size: 600
+        recognition_threshold: 0.6
+
+    - name: "openalpr local cpu"
+      description: "openalpr local SDK (binary) model"
+      model_type: alpr
+      framework: alpr
+#      processor: cpu
+
+      service: openalpr
+      api_type: local
+#      api_url: "http://localhost:8080"
+#      api_key: "sk_1234567890"
+
+      detection_options:
+        alpr_binary: alpr
+#        alpr_binary_params:
+        confidence: 0.5
+        max_size: 600
+
+    - name: "openalpr local gpu"
+      description: "openalpr local SDK (binary) GPU CUDA model"
+      model_type: alpr
+      framework: alpr
+      processor: gpu
+
+      service: openalpr
+      api_type: local
+#      api_url: "http://localhost:8080"
+#      api_key: "sk_1234567890"
+
+      detection_options:
+        alpr_binary: alpr
+        alpr_binary_params: -GPU
+        confidence: 0.5
+        max_size: 600
+
+    - name: "openalpr cloud"
+      description: "openalpr cloud API model"
+      model_type: alpr
+      framework: alpr
+      processor: cpu
+
+      service: openalpr
+      api_type: cloud
+#        api_url: "https://api.openalpr.com/v2/recognize_bytes"
+      api_key: "sk_1234567890"
+
+      detection_options:
+          confidence: 0.5
+          max_size: 600
+#          recognize_vehicle: yes
+#          country: us
+#          state: ca
+
+    - name: 'Platerecognizer cloud'
+#      enabled: no
+      model_type: alpr
+      framework: alpr
+      service: plate_recognizer
+      api_type: cloud
+#      api_url: "https://api.platerecognizer.com/v1/plate-reader/"
+      api_key: someAPIkeyHERE123
+      detection_options:
+#        regions:
+        stats: no
+        min_dscore: 0.5
+        min_score: 0.5
+        max_size: 1600
+
+        payload:
+          regions: ['us']
+          camera_id: 12
+
+        config:
+          region: 'strict'
+          mode:  'fast'
+
+    - name: yolov7
+      enabled: no
+      description: "YOLO v7 pretrained DarkNet model - Requires SiLu activation in OpenCV"
+      input: "${model_dir}/yolov7/yolov7.weights"
+      config: "${model_dir}/yolov7/yolov7_darknet.cfg"
+      square: yes
+
+    - name: yolov7x
+      enabled: no
+      description: "YOLO v7-X pretrained DarkNet model - Requires SiLu activation in OpenCV"
+      input: "${model_dir}/yolov7/yolov7x.weights"
+      config: "${model_dir}/yolov7/yolov7x_darknet.cfg"
