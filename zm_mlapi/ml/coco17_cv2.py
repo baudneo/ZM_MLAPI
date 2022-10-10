@@ -1,6 +1,6 @@
 from typing import List
 
-COCO_NAMES: List[str] = [
+COCO17: List[str] = [
     "person",
     "bicycle",
     "car",

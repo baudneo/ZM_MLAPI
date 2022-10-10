@@ -1,17 +1,15 @@
+import json
 import logging
 import tempfile
 import uuid
-from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Union, List, Dict, Optional, IO, Any
 
 import numpy as np
-import portalocker
-from fastapi import UploadFile, File, Form
 from pydantic import BaseModel, Field, validator, BaseSettings
 from pydantic.fields import ModelField
-
+from zm_mlapi.ml.coco17_cv2 import COCO17
 
 logger = logging.getLogger("zm_mlapi")
 
@@ -51,8 +49,7 @@ def check_model_config_file(v, values, field: ModelField) -> Optional[Path]:
     return v
 
 
-def check_labels_file(v, values, field: ModelField) -> Optional[Path]:
-
+def check_labels_file(v, values, field: ModelField):
     msg = f"{field.name} is required"
     if not v:
         raise ValueError(f"{msg}, it is set as 'None' or empty (Not Configured)!")
@@ -77,17 +74,18 @@ class ModelType(str, Enum):
 
 class ModelFrameWork(str, Enum):
     OPENCV = "opencv"
+    YOLO = "yolo"
+    CV_YOLO = YOLO
     CORAL = "coral"
     PYCORAL = CORAL
-    # VINO = "openvino"
-    # OPENVINO = VINO
+    EDGETPU = CORAL
+    EDGE_TPU = CORAL
     TENSORFLOW = "tensorflow"
     PYTORCH = "pytorch"
     DEEPFACE = "deepface"
-    OPENALPR = "openalpr"
-    DLIB = "dlib"
-    FACE_RECOGNITION = DLIB
-    DEFAULT = OPENCV
+    ALPR = "alpr"
+    FACE_RECOGNITION = "face_recognition"
+    DEFAULT = CV_YOLO
 
 
 class ModelProcessor(str, Enum):
@@ -97,10 +95,23 @@ class ModelProcessor(str, Enum):
     DEFAULT = CPU
 
 
-class FaceModel(str, Enum):
+class FaceRecognitionLibModelTypes(str, Enum):
     CNN = "cnn"
     HOG = "hog"
     DEFAULT = CNN
+
+
+class ALPRAPIType(str, Enum):
+    LOCAL = "local"
+    CLOUD = "cloud"
+    DEFAULT = LOCAL
+
+
+class ALPRService(str, Enum):
+    OPENALPR = "openalpr"
+    PLATE_RECOGNIZER = "plate_recognizer"
+    SCOUT = OPENALPR
+    DEFAULT = OPENALPR
 
 
 class DetectionResult(BaseModel):
@@ -114,95 +125,140 @@ class DetectionResult(BaseModel):
     bounding_box: List[List[Union[float, int]]] = None
 
 
-class ModelOptions(BaseModel):
-    processor: Optional[ModelProcessor] = Field(
-        ModelProcessor.CPU, description="Processor to use for model"
-    )
-    height: Optional[int] = Field(
-        416, ge=1, description="Height of the input image (resized for model)"
-    )
-    width: Optional[int] = Field(
-        416, ge=1, description="Width of the input image (resized for model)"
-    )
-    square: Optional[bool] = Field(
-        False, description="Zero pad the image to be a square"
-    )
-    fp_16: Optional[bool] = Field(
-        False, description="model uses Floating Point 16 Backend (EXPERIMENTAL!)"
-    )
+class BaseModelOptions(BaseModel):
     confidence: Optional[float] = Field(
-        0.5, ge=0.0, le=1.0, descritpiton="Confidence Threshold"
+        0.2, ge=0.0, le=1.0, descritpiton="Confidence Threshold"
     )
+
+
+class CV2YOLOModelOptions(BaseModelOptions):
     nms: Optional[float] = Field(
         0.4, ge=0.0, le=1.0, description="Non-Maximum Suppression Threshold"
     )
 
 
-class FaceModelOptions(ModelOptions):
-    # Face Detection Options
+class FaceRecognitionLibModelOptions(BaseModelOptions):
+    # face_recognition lib config Options
     upsample_times: int = Field(
         1,
-        ge=1,
-        description="How many times to upsample the image looking for faces. Higher numbers find smaller faces but take longer.",
+        ge=0,
+        description="How many times to upsample the image looking for faces. "
+        "Higher numbers find smaller faces but take longer.",
     )
     num_jitters: int = Field(
         1,
-        ge=1,
-        description="How many times to re-sample the face when calculating encoding. Higher is more accurate, but slower (i.e. 100 is 100x slower)",
+        ge=0,
+        description="How many times to re-sample the face when calculating encoding. "
+        "Higher is more accurate, but slower (i.e. 100 is 100x slower)",
     )
-    face_model: FaceModel = Field(
-        FaceModel.DEFAULT, description="Face model to use for detection"
-    )
-    face_train_model: FaceModel = Field(
-        FaceModel.DEFAULT, description="Face model to use for training"
-    )
-    known_faces_dir: Optional[Union[Path, str]] = Field(
-        None, description="Path to parent directory for known faces"
-    )
-    face_max_size: int = Field(
+
+    max_size: int = Field(
         600,
-        ge=1,
+        ge=100,
         description="Maximum size (Width) of image to load into memory for "
-        "face detection",
+        "face detection (image will be scaled)",
     )
     recognition_threshold: float = Field(
         0.6,
         ge=0.0,
         le=1.0,
-        description="Recognition distance threshold for " "face recognition",
+        description="Recognition distance threshold for face recognition",
     )
-    unknown_face_name: str = Field(
-        "Unknown", description="Name to use for unknown faces"
+
+
+class ALPRModelOptions(BaseModelOptions):
+    max_size: int = Field(
+        600,
+        ge=1,
+        description="Maximum size (Width) of image to load into memory",
     )
-    save_unknown_faces: bool = Field(
+
+
+class OpenALPRLocalModelOptions(ALPRModelOptions):
+    openalpr_binary: str = Field("alpr", description="OpenALPR binary name")
+    openalpr_binary_params: str = Field(
+        "-d",
+        description="OpenALPR binary parameters (-j is ALWAYS passed)",
+        example="-p ca -c US",
+    )
+
+
+class OpenALPRCloudModelOptions(ALPRModelOptions):
+    # For an explanation of params, see http://doc.openalpr.com/api/?api=cloudapi
+    recognize_vehicle: bool = Field(
+        True,
+        description="If True, will attempt to recognize the vehicle type (ie: Ford Mustang)",
+    )
+    country: str = Field(
+        "us",
+        description="Country of license plate to recognize.",
+    )
+    state: str = Field(
+        None,
+        description="State of license plate to recognize.",
+    )
+
+
+class PlateRecognizerModelOptions(BaseModelOptions):
+    stats: bool = Field(
         False,
-        description="Save cropped unknown faces to disk, can be "
-        "used to train a model",
+        description="Return stats about the plate recognition request",
     )
-    unknown_faces_leeway_pixels: int = Field(
-        0,
-        description="Unknown faces leeway pixels, used when cropping the image to capture a face",
+    payload: Dict = Field(
+        None,
+        description="Override the payload sent to the Plate Recognizer API, must be a JSON serializable string",
     )
-    unknown_faces_dir: Optional[Union[Path, str]] = Field(
-        None, description="Directory to save unknown faces to"
+    config: Dict = Field(
+        None,
+        description="Override the config sent to the Plate Recognizer API, must be a JSON serializable string",
     )
-    face_train_max_size: int = Field(
-        800,
-        description="Maximum size of image to load into memory for face training, "
-        "Larger will consume more memory!",
+    # If you want to specify regions. See http://docs.platerecognizer.com/#regions-supported
+    regions: List[str] = Field(
+        None,
+        example=["us", "cn", "kr", "ca"],
+        description="List of regions to search for plates in. If not specified, all regions are searched. See http://docs.platerecognizer.com/#regions-supported",
+    )
+    # minimal confidence for actually detecting a plate (Just a license plate, not the actual license plate text)
+    min_dscore: float = Field(
+        0.1,
+        ge=0,
+        le=1.0,
+        description="Minimal confidence for actually detecting a plate",
+    )
+    # minimal confidence for the translated text (plate number)
+    min_score: float = Field(
+        0.5,
+        ge=0,
+        le=1.0,
+        description="Minimal confidence for the translated text from the plate",
     )
 
+    @validator("config", "payload")
+    def check_json_serializable(cls, v):
+        try:
+            json.dumps(v)
+        except TypeError:
+            raise ValueError("Must be JSON serializable")
+        return v
 
-class ALPRModelOptions(ModelOptions):
-    test: str = None
+
+class DeepFaceModelOptions(BaseModelOptions):
+    pass
 
 
-class MLModelConfig(BaseModel):
+class CV2TFModelOptions(BaseModelOptions):
+    pass
+
+
+class PyTorchModelOptions(BaseModelOptions):
+    pass
+
+
+class BaseModelConfig(BaseModel):
     id: uuid.UUID = Field(
         default_factory=uuid.uuid4, description="Unique ID of the model"
     )
     name: str = Field(..., description="model name")
-    input: Path = Field(..., description="model file/dir path")
     enabled: bool = Field(True, description="model enabled")
     description: str = Field(None, description="model description")
     framework: ModelFrameWork = Field(
@@ -211,32 +267,48 @@ class MLModelConfig(BaseModel):
     model_type: ModelType = Field(
         ModelType.DEFAULT, description="model type (object, face, alpr)"
     )
+    processor: Optional[ModelProcessor] = Field(
+        ModelProcessor.CPU, description="Processor to use for model"
+    )
+
+    detection_options: Union[
+        BaseModelOptions,
+        FaceRecognitionLibModelOptions,
+        OpenALPRLocalModelOptions,
+        OpenALPRCloudModelOptions,
+        PlateRecognizerModelOptions,
+        ALPRModelOptions,
+    ] = Field(BaseModelOptions, description="Default Configuration for the model")
+
+    @validator("name")
+    def check_name(cls, v):
+        v = str(v).strip().casefold()
+        return v
+
+
+class CV2YOLOModelConfig(BaseModelConfig):
+    input: Path = Field(None, description="model file/dir path (Optional)")
     classes: Path = Field(default=None, description="model labels file path (Optional)")
     config: Path = Field(default=None, description="model config file path (Optional)")
+    height: Optional[int] = Field(
+        416, ge=1, description="Model input height (resized for model)"
+    )
+    width: Optional[int] = Field(
+        416, ge=1, description="Model input width (resized for model)"
+    )
+    square: Optional[bool] = Field(
+        False, description="Zero pad the image to be a square"
+    )
+    cv2_cuda_fp_16: Optional[bool] = Field(
+        False, description="model uses Floating Point 16 Backend (EXPERIMENTAL!)"
+    )
+
     labels: List[str] = Field(
-        default=None,
+        default=COCO17,
         description="model labels parsed into a list of strings",
         repr=False,
         exclude=True,
     )
-
-    detection_options: ModelOptions = Field(
-        default_factory=ModelOptions, description="Default Configuration for the model"
-    )
-
-    @validator("framework", pre=True)
-    def framework_validator(cls, v):
-        if isinstance(v, str):
-            v = v.lower()
-            v = ModelFrameWork(v)
-        return v
-
-    @validator("model_type", pre=True)
-    def model_type_validator(cls, v):
-        if isinstance(v, str):
-            v = v.lower()
-            v = ModelType(v)
-        return v
 
     @validator("config", "input", "classes", pre=True, always=True)
     def str_to_path(cls, v, values, field: ModelField) -> Optional[Path]:
@@ -246,29 +318,15 @@ class MLModelConfig(BaseModel):
         lp = f"Model Name: {model_name} ->"
 
         if v is None:
-            if field.name == "input":
-                raise ValueError(f"{msg}, not 'None'")
-            logger.debug(f"{lp} {field.name} is None, passing as it is Optional")
+            # logger.debug(f"{lp} {field.name} is None, passing as it is Optional")
             return v
         elif not isinstance(v, (Path, str)):
             raise ValueError(msg)
         elif isinstance(v, str):
-            # logger.debug(
-            #     f"Attempting to convert {field.name} string '{v}' to Path object"
-            # )
             v = Path(v)
         if field.name == "config":
             if values["input"].suffix == ".weights":
                 msg = f"'{field.name}' is required when 'input' is a DarkNet .weights file"
-
-        msg = f"{field.name} is required"
-        assert v, f"{msg}, it is set as '{v}' (Not Defined)!"
-        assert v.exists(), f"{msg}, it does not exist"
-        assert v.is_file(), f"{msg}, it is not a file"
-        assert isinstance(v, Path), f"{field.name} is not a Path object"
-        # logger.debug(
-        #     f"DBG>>> {field.name} is a validated Path object -> RETURNING {type(v) = } --> {v = }"
-        # )
         return v
 
     @validator("labels", always=True)
@@ -281,9 +339,9 @@ class MLModelConfig(BaseModel):
                 logger.debug(
                     f"{lp} 'classes' is not defined. Using *default* COCO 2017 class labels"
                 )
-                from zm_mlapi.ml.coco_2017 import COCO_NAMES
+                from zm_mlapi.ml.coco17_cv2 import COCO17
 
-                v = COCO_NAMES
+                v = COCO17
             else:
                 logger.debug(
                     f"'classes' is defined. Parsing '{labels_file}' into a list of strings for class identification"
@@ -300,16 +358,75 @@ class MLModelConfig(BaseModel):
         return v
 
 
-class ALPRService(str, Enum):
-    LOCAL = "local"
-    CLOUD = "cloud"
-    DEFAULT = LOCAL
+class FaceRecognitionLibModelConfig(BaseModelConfig):
+    """Config cant be changed after loading - Options can be changed"""
+
+    detection_options: FaceRecognitionLibModelOptions = Field(
+        default_factory=FaceRecognitionLibModelOptions,
+        description="Default Configuration for the model",
+    )
+    model: FaceRecognitionLibModelTypes = Field(
+        FaceRecognitionLibModelTypes.DEFAULT,
+        description="Face Detection Model to use. 'cnn' is more accurate but slower on CPUs. "
+        "'hog' is faster but less accurate",
+    )
+    train_max_size: int = Field(
+        800,
+        description="Maximum size of image to load into memory for face training, "
+        "Larger will consume more memory!",
+    )
+    unknown_face_name: str = Field(
+        "Unknown", description="Name to use for unknown faces"
+    )
+    save_unknown_faces: bool = Field(
+        False,
+        description="Save cropped unknown faces to disk, can be "
+        "used to train a model",
+    )
+    unknown_faces_leeway_pixels: int = Field(
+        0,
+        description="Unknown faces leeway pixels, used when cropping the image to capture a face",
+    )
+    unknown_faces_dir: Optional[Union[Path, str]] = Field(
+        None, description="Directory to save unknown faces to"
+    )
+    detection_model: FaceRecognitionLibModelTypes = Field(
+        FaceRecognitionLibModelTypes.DEFAULT,
+        description="Face model to use for detection",
+    )
+    training_model: FaceRecognitionLibModelTypes = Field(
+        FaceRecognitionLibModelTypes.DEFAULT,
+        description="Face model to use for training",
+    )
+    known_faces_dir: Optional[Union[Path, str]] = Field(
+        None, description="Path to parent directory of known faces for training"
+    )
 
 
-class ALPRModelConfig(MLModelConfig):
-    alpr_key: str = Field(None, description="ALPR Cloud API Key")
-    alpr_service: ALPRService = Field(ALPRService.LOCAL, description="ALPR Service Type")
-    alpr_url: str = Field(None, description="ALPR Cloud API URL")
+class ALPRModelConfig(BaseModelConfig):
+    api_type: ALPRAPIType = Field(ALPRAPIType.LOCAL, description="ALPR Service Type")
+    service: ALPRService = Field(ALPRService.DEFAULT, description="ALPR Service to use")
+    api_key: str = Field(None, description="ALPR API Key (Cloud/Local)")
+    api_url: str = Field(None, description="ALPR API URL (Cloud/Local)")
+
+
+class HOGModelConfig(BaseModelConfig):
+    stride: str = None
+    padding: str = None
+    scale: float = None
+    mean_shift: bool = False
+
+
+class DeepFaceModelConfig(BaseModelConfig):
+    pass
+
+
+class CV2TFModelConfig(BaseModelConfig):
+    pass
+
+
+class PyTorchModelConfig(BaseModelConfig):
+    pass
 
 
 class ModelConfigFromFile:
@@ -317,6 +434,9 @@ class ModelConfigFromFile:
     raw: str
     parsed_raw: dict
     parsed: dict
+
+    def __iter__(self):
+        return iter(self.parsed.get("models", []))
 
     def __repr__(self):
         return f"{self.__class__.__name__}({self.file})->{self.parsed.get('models')}"
@@ -416,75 +536,56 @@ class ModelConfigFromFile:
 class LockSetting(BaseModel):
     max: int = Field(1, description="Maximum number of parallel processes")
     timeout: int = Field(30, description="Timeout in seconds for acquiring a lock")
+    name: str = Field(default_factory=str, description="Name of the lock file")
 
 
 class LockSettings(BaseModel):
-    lock_dir: str = Field(f"{tempfile.gettempdir()}/zm_mlapi/locks", description="Directory for lock files (Default is Systems temporary directory)")
-    gpu: LockSetting = Field(default_factory=LockSetting, description="GPU Lock Settings")
-    cpu: LockSetting = Field(default_factory=LockSetting, description="CPU Lock Settings")
-    tpu: LockSetting = Field(default_factory=LockSetting, description="TPU Lock Settings")
+    gpu: LockSetting = Field(
+        default_factory=LockSetting, description="GPU Lock Settings"
+    )
+    cpu: LockSetting = Field(
+        default_factory=LockSetting, description="CPU Lock Settings"
+    )
+    tpu: LockSetting = Field(
+        default_factory=LockSetting, description="TPU Lock Settings"
+    )
+    lock_dir: Union[str, Path] = Field(
+        None,
+        description="Directory for lock files (Default is Systems temporary directory)",
+    )
 
+    @validator("gpu", "cpu", "tpu", pre=True, always=True)
+    def set_lock_name(cls, v, field, values):
+        # logger.debug(f"locks validator {v = } --- {field.name = } -- {values = }")
+        if v:
+            v = LockSetting(**v)
+            v.name = f"zm-mlapi_{field.name}"
+        return v
 
-class MLLocks:
-    locks: Dict[str, portalocker.BoundedSemaphore] = {}
+    def get(self, device: str) -> LockSetting:
+        device = device.casefold()
+        if device == "gpu":
+            return self.gpu
+        elif device == "cpu":
+            return self.cpu
+        elif device == "tpu":
+            return self.tpu
+        else:
+            raise ValueError(f"Invalid device type: {device}")
 
-    def __next__(self):
-        return next(self.locks.__iter__())
-
-    def __contains__(self, processor: str) -> bool:
-        return processor in self.locks
-
-    def __get__(self, instance, owner):
-        return self.locks
-
-    def __set__(self, instance, value):
-        raise SyntaxError("Cannot set locks")
-
-    def __getitem__(self, processor: str) -> portalocker.BoundedSemaphore:
-        return self.get_lock(processor)
-
-    def __iter__(self):
-        return iter(self.locks)
-
-    def __len__(self):
-        return len(self.locks)
-
-    def __repr__(self):
-        return f"MLLocks({self.locks})"
-
-    def __str__(self):
-        return f"MLLocks({self.locks})"
-
-    def __init__(self, locks: LockSettings):
-        self.locks = {
-            "gpu": portalocker.BoundedSemaphore(
-                locks.gpu.max,
-                directory=locks.lock_dir,
-                name="zm_mlapi-gpu",
-                timeout=locks.gpu.timeout,
-            ),
-            "cpu": portalocker.BoundedSemaphore(
-                locks.cpu.max,
-                directory=locks.lock_dir,
-                name="zm_mlapi-cpu",
-                timeout=locks.cpu.timeout,
-            ),
-            "tpu": portalocker.BoundedSemaphore(
-                locks.tpu.max,
-                directory=locks.lock_dir,
-                name="zm_mlapi-tpu",
-                timeout=locks.tpu.timeout,
-            ),
-        }
-
-    def get_lock(self, processor: str) -> portalocker.BoundedSemaphore:
-        if processor in self.locks:
-            return self.locks[processor]
-        raise SyntaxError(f"Invalid processor: {processor}")
+    @validator("lock_dir", pre=True, always=True)
+    def validate_lock_dir(cls, v):
+        if not v:
+            v = f"{tempfile.gettempdir()}/zm_mlapi/locks"
+        # assert isinstance(v, str), "lock_dir must be a string"
+        temp_dir = Path(v)
+        if not temp_dir.exists():
+            logger.debug(f"Creating lock directory: {temp_dir}")
+            temp_dir.mkdir(parents=True)
+        return v
 
 
 class Settings(BaseSettings):
-
     model_config: Path = Field(
         ..., description="Path to the model configuration YAML file"
     )
@@ -505,29 +606,77 @@ class Settings(BaseSettings):
     models: ModelConfigFromFile = Field(
         None, description="ModelConfig object", exclude=True, repr=False
     )
-    available_models: List[MLModelConfig] = Field(None, description="Available models")
-    locks: LockSettings = Field(default_factory=LockSettings, description="Lock Settings", repr=False)
-
-    ml_locks: MLLocks = Field(None, description="ML Locks class")
+    available_models: List[BaseModelConfig] = Field(None, description="Available models")
+    disable_locks: bool = Field(False, description="Disable file locking")
+    lock_settings: LockSettings = Field(
+        default_factory=LockSettings, description="Lock Settings", repr=False
+    )
 
     class Config:
-        env_nested_delimiter = '__'
+        env_nested_delimiter = "__"
 
-    @validator("ml_locks")
-    def ml_locks_validator(cls, v, values):
-        locks = values.get("locks")
-        if locks:
-            v = MLLocks(values["locks"])
-        logger.info(f"Settings._ml_locks_validator: {locks = }")
-        return v
+    def get_lock_settings(self):
+        return self.lock_settings
 
     @validator("available_models")
     def validate_available_models(cls, v, values):
         models = values.get("models")
+        # logger.info(f"Settings._validate_available_models: {models = }")
         if models:
             v = []
-            for model in models.parsed.get("models"):
-                v.append(MLModelConfig(**model))
+            for model in models:
+                if model.get("enabled", True) is True:
+                    # logger.debug(f"Adding model: {type(model) = } ------ {model = }")
+                    _framework = model.get("framework", "yolo")
+                    _options = model.get("detection_options", {})
+                    _type = model.get("model_type", "object")
+                    logger.debug(f"DBG<<< {_framework} FRAMEWORK RAW options are {_options}")
+                    if _framework == ModelFrameWork.FACE_RECOGNITION:
+                        model["model_type"] = ModelType.FACE
+                        model["detection_options"] = FaceRecognitionLibModelOptions(**_options)
+                        v.append(FaceRecognitionLibModelConfig(**model))
+                    elif _framework == ModelFrameWork.ALPR:
+                        model["model_type"] = ModelType.ALPR
+                        api_type = model.get("api_type", "local")
+                        api_service = model.get("service", "openalpr")
+                        logger.debug(f"DEBUG>>> FrameWork: {_framework}  Service: {api_service} [{api_type}]")
+                        config = ALPRModelConfig(**model)
+                        if api_service == ALPRService.OPENALPR:
+                            if api_type == ALPRAPIType.LOCAL:
+                                config.detection_options = OpenALPRLocalModelOptions(
+                                    **_options
+                                )
+                            elif api_type == ALPRAPIType.CLOUD:
+                                config.processor = None
+                                config.detection_options = OpenALPRCloudModelOptions(
+                                    **_options
+                                )
+                        elif api_service == ALPRService.PLATE_RECOGNIZER:
+                            if api_service == ALPRAPIType.CLOUD:
+                                config.processor = None
+                            config.detection_options = PlateRecognizerModelOptions(
+                                **_options
+                            )
+                        logger.debug(
+                            f"DEBUG>>> FINAL ALPR OPTIONS {config.detection_options = }"
+                        )
+                        v.append(config)
+                    elif _framework == ModelFrameWork.CV_YOLO:
+                        config = CV2YOLOModelConfig(**model)
+                        config.detection_options = CV2YOLOModelOptions(**_options)
+                        logger.debug(
+                            f"DEBUG>>> FINAL YOLO OPTIONS {config.detection_options = }"
+                        )
+                        v.append(config)
+                    else:
+                        logger.debug(
+                            f"DEBUG>>> this FRAMEWORK is NOT IMPLEMENTED -> {_framework}"
+                        )
+                        v.append(BaseModelConfig(**model))
+                else:
+                    logger.debug(f"Skipping disabled model: {model.get('name')}")
+
+                # logger.info(f"Settings._validate_available_models: {model = }")
         return v
 
     @validator("debug")
@@ -574,74 +723,136 @@ class APIDetector:
     Specify a processor type and then load the model into processor memory. run an inference on the processor
     """
 
-    model_config: MLModelConfig
-    model_options: ModelOptions
-    model_processor: ModelProcessor
+    id: uuid.UUID = Field(None, description="Model ID")
+    _config: Union[
+        BaseModelConfig,
+        CV2YOLOModelConfig,
+        ALPRModelConfig,
+        FaceRecognitionLibModelConfig,
+        DeepFaceModelConfig,
+    ]
+    _options: Union[
+        BaseModelOptions,
+        OpenALPRLocalModelOptions,
+        OpenALPRCloudModelOptions,
+        PlateRecognizerModelOptions,
+        ALPRModelOptions,
+        FaceRecognitionLibModelOptions,
+        CV2YOLOModelOptions
+    ]
 
     def __repr__(self):
-        return f"{self.__class__.__name__}({self.model_config} <--> Options: {self.model_options})"
+        return f"{self.__class__.__name__}({self.config})"
 
     def __get__(self, instance, owner):
         return self
 
     def __init__(
         self,
-        model: MLModelConfig,
-        options: Optional[
-            Union[ModelOptions, FaceModelOptions, ALPRModelOptions]
-        ] = None,
+        model_config: Union[
+            BaseModelConfig,
+            CV2YOLOModelConfig,
+            ALPRModelConfig,
+            FaceRecognitionLibModelConfig,
+            DeepFaceModelConfig,
+        ],
     ):
-        self.model_options = options
-        self.model_config = model
-        if not self.model_options.processor:
-            if model.framework == ModelFrameWork.CORAL:
-                logger.warning(
-                    f"Using default processor for {model.framework} -> {ModelProcessor.TPU}"
-                )
-                self.model_options.processor = ModelProcessor.TPU
-            else:
-                self.model_options.processor = ModelProcessor.CPU
-            logger.debug(
-                f"no processor specified, using {model.framework} default: {self.model_options.processor}"
-            )
-        self.model_processor = self.model_options.processor
-        self.model = None
+        from zm_mlapi.ml.detectors.opencv.cv_yolo import CV2YOLODetector
+
+        self.config = model_config
+        self.id = self.config.id
+        self.options = model_config.detection_options
+        self.model: Optional[CV2YOLODetector] = None
         self._load_model()
 
-    def _load_model(self):
+    @property
+    def options(
+        self,
+    ) -> Union[
+        BaseModelOptions,
+        OpenALPRLocalModelOptions,
+        OpenALPRCloudModelOptions,
+        PlateRecognizerModelOptions,
+        ALPRModelOptions,
+        FaceRecognitionLibModelOptions,
+    ]:
+        return self._options
+
+    @options.setter
+    def options(
+        self,
+        options: Union[
+            BaseModelOptions,
+            OpenALPRLocalModelOptions,
+            OpenALPRCloudModelOptions,
+            PlateRecognizerModelOptions,
+            ALPRModelOptions,
+            FaceRecognitionLibModelOptions,
+        ],
+    ):
+        self._options = options
+
+    def _load_model(
+        self,
+        config: Optional[
+            Union[
+                BaseModelConfig,
+                CV2YOLOModelConfig,
+                ALPRModelConfig,
+                FaceRecognitionLibModelConfig,
+                DeepFaceModelConfig,
+            ]
+        ] = None,
+    ):
         """Load the model"""
-        if not self.is_processor_available():
+
+        self.model = None
+        if config:
+            self.config = config
+        if self.config.processor and not self.is_processor_available():
             raise RuntimeError(
-                f"{self.model_processor} is not available on this system"
+                f"{self.config.processor} is not available on this system"
+            )
+        if self.config.framework == ModelFrameWork.YOLO:
+            from zm_mlapi.ml.detectors.opencv.cv_yolo import CV2YOLODetector
+
+            self.model = CV2YOLODetector(self.config)
+        elif self.config.framework == ModelFrameWork.FACE_RECOGNITION:
+            from zm_mlapi.ml.detectors.face_recognition import (
+                FaceRecognitionLibDetector,
+            )
+            self.model = FaceRecognitionLibDetector(self.config)
+        elif self.config.framework == ModelFrameWork.ALPR:
+            from zm_mlapi.ml.detectors.alpr import OpenAlprCmdLine, OpenAlprCloud, PlateRecognizer
+            if self.config.service == ALPRService.PLATE_RECOGNIZER:
+                self.model = PlateRecognizer(self.config)
+            elif self.config.service == ALPRService.OPENALPR:
+                if self.config.api_type == ALPRAPIType.LOCAL:
+                    self.model = OpenAlprCmdLine(self.config)
+                elif self.config.api_type == ALPRAPIType.CLOUD:
+                    self.model = OpenAlprCloud(self.config)
+        else:
+            logger.warning(
+                f"CANT CREATE DETECTOR -> Framework NOT IMPLEMENTED!!! {self.config.framework}"
             )
 
-        if self.model_config.framework == ModelFrameWork.OPENCV:
-            from zm_mlapi.ml.opencv import OpenCVDetector as OpenCVDetector
-
-            self.model = OpenCVDetector(self.model_config, self.model_options)
-
-    def set_model_options(self, options: ModelOptions):
-        if not options:
-            logger.warning("No options specified, using existing options")
-            return
-        if options != self.model_options:
-            logger.debug(f"updating (reloading) model with options: {options}")
-            self.model_options = options
-            self._load_model()
-
-    def is_processor_available(self):
+    def is_processor_available(self) -> bool:
         """Check if the processor is available"""
         available = False
-        if self.model_processor == ModelProcessor.CPU:
-            if self.model_config.framework == ModelFrameWork.CORAL:
-                logger.error(
-                    f"{self.model_processor} is not supported for {self.model_config.framework}"
-                )
+        processor = self.config.processor
+        framework = self.config.framework
+        if framework == ModelFrameWork.ALPR:
+            available = True
+        elif not processor:
+            available = True
+        elif processor == ModelProcessor.CPU:
+            if framework == ModelFrameWork.CORAL:
+                logger.error(f"{processor} is not supported for {framework}")
             else:
                 available = True
 
-        elif self.model_processor == ModelProcessor.TPU:
-            if self.model_config.framework == ModelFrameWork.CORAL:
+        elif processor == ModelProcessor.TPU:
+            if framework == ModelFrameWork.CORAL:
                 try:
                     import pycoral
                 except ImportError:
@@ -658,8 +869,8 @@ class APIDetector:
                         )
             else:
                 logger.warning("TPU processor is only available for Coral models!")
-        elif self.model_processor == ModelProcessor.GPU:
-            if self.model_config.framework == ModelFrameWork.OPENCV:
+        elif processor == ModelProcessor.GPU:
+            if framework == ModelFrameWork.OPENCV or framework == ModelFrameWork.YOLO:
                 try:
                     import cv2.cuda
                 except ImportError:
@@ -674,7 +885,7 @@ class APIDetector:
                     else:
                         logger.debug(f"Found {cuda_devices} CUDA device(s)")
                         available = True
-            elif self.model_config.framework == ModelFrameWork.TENSORFLOW:
+            elif framework == ModelFrameWork.TENSORFLOW:
                 try:
                     import tensorflow as tf
                 except ImportError:
@@ -688,7 +899,7 @@ class APIDetector:
                         )
                     else:
                         available = True
-            elif self.model_config.framework == ModelFrameWork.PYTORCH:
+            elif framework == ModelFrameWork.PYTORCH:
                 try:
                     import torch
                 except ImportError:
@@ -702,6 +913,19 @@ class APIDetector:
                         )
                     else:
                         available = True
+            elif framework == ModelFrameWork.FACE_RECOGNITION:
+                try:
+                    import dlib
+                except ImportError:
+                    logger.warning(
+                        "dlib not installed, cannot load any models that use dlib GPU processor"
+                    )
+                else:
+                    if dlib.DLIB_USE_CUDA and dlib.cuda.get_num_devices() >= 1:
+                        available = True
+            elif framework == ModelFrameWork.DEEPFACE:
+                logger.warning("WORKING ON DeepFace models!")
+                pass
         return available
 
     def detect(self, image: np.ndarray) -> Dict[str, Any]:
@@ -711,13 +935,12 @@ class APIDetector:
 
 
 class GlobalConfig(BaseModel):
-    available_models: List[MLModelConfig] = Field(
-        default_factory=dict, description="Available models, call by ID"
+    available_models: List[BaseModelConfig] = Field(
+        default_factory=list, description="Available models, call by ID"
     )
     settings: Settings = Field(
         default=None, description="Global settings from ENVIRONMENT"
     )
-
     detectors: List[APIDetector] = Field(
         default_factory=list, description="Loaded detectors"
     )
@@ -725,34 +948,18 @@ class GlobalConfig(BaseModel):
     class Config:
         arbitrary_types_allowed = True
 
-
-class MLSequence(BaseModel):
-    """ML Sequence class, used to sequence multiple detectors"""
-    id: int = Field(default=0, description="Sequence ID")
-
-    name: str = Field(
-        default="default", description="Name of the sequence, used for logging"
-    )
-    detectors: List[APIDetector] = Field(
-        default_factory=list, description="Detectors to run in sequence"
-    )
-    class Config:
-        arbitrary_types_allowed = True
-
-    def __repr__(self):
-        return f"{self.__class__.__name__}({self.name} <--> Detectors: {self.detectors})"
-
-    def detect(self, image: np.ndarray) -> Dict[str, Any]:
-        """Detect objects in the image using threads"""
-        from concurrent.futures import ThreadPoolExecutor
-        threads = []
-        results = {}
+    def get_detector(self, model: BaseModelConfig) -> Optional[APIDetector]:
+        """Get a detector by ID"""
+        ret_: Optional[APIDetector] = None
         for detector in self.detectors:
-            threads.append(
-                ThreadPoolExecutor(max_workers=10).submit(detector.detect, image=image)
+            if detector.config.id == model.id:
+                ret_ = detector
+        if not ret_:
+            logger.debug(
+                f"Creating new detector for '{model.name}'"
             )
-
-        for thread in threads:
-
-            results.update(thread.result(timeout=10))
-        return results
+            ret_ = APIDetector(model)
+            self.detectors.append(ret_)
+        if not ret_:
+            logger.error(f"Unable to create detector for {model.name}")
+        return ret_
