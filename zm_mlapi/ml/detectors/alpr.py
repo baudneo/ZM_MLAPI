@@ -186,7 +186,7 @@ class PlateRecognizer(AlprBase):
                     )
 
         return {
-            "detections": True if labels else False,
+            "success": True if labels else False,
             "type": self.config.model_type,
             "processor": self.processor,
             "model_name": self.name,
@@ -272,7 +272,7 @@ class OpenAlprCloud(AlprBase):
                 confs.append(conf)
 
         return {
-            "detections": True if labels else False,
+            "success": True if labels else False,
             "type": self.config.model_type,
             "processor": self.processor,
             "model_name": self.name,
@@ -362,7 +362,7 @@ class OpenAlprCmdLine(AlprBase):
                 confs.append(conf)
 
         return {
-            "detections": True if labels else False,
+            "success": True if labels else False,
             "type": self.config.model_type,
             "processor": self.processor,
             "model_name": self.name,

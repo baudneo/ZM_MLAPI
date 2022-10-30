@@ -117,7 +117,7 @@ class ALPRService(str, Enum):
 
 
 class DetectionResult(BaseModel):
-    detections: bool = False
+    success: bool = False
     type: ModelType = None
     processor: ModelProcessor = None
     model_name: str = None

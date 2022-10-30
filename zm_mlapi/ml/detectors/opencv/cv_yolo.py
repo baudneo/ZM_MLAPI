@@ -13,6 +13,7 @@ logger = getLogger("zm_mlapi")
 class CV2YOLODetector(CV2Base):
     def __init__(self, model_config: CV2YOLOModelConfig):
         super().__init__(model_config)
+        # self.is_locked: bool = False
         # Model init params not initialized in super()
         self.model: Optional[cv2.dnn.DetectionModel] = None
         # logger.debug(f"{LP} configuration: {self.config}")
@@ -125,7 +126,7 @@ class CV2YOLODetector(CV2Base):
         finally:
             self.release_lock()
         return {
-            "detections": True if labels else False,
+            "success": True if labels else False,
             "type": self.config.model_type,
             "processor": self.processor,
             "model_name": self.name,

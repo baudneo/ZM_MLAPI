@@ -14,6 +14,8 @@ LP: str = 'Lock:'
 
 class FileLock:
     lock: Optional[BoundedSemaphore] = None
+    is_locked: bool = False
+
     def create_lock(self):
         if locks_enabled():
             if self.lock:

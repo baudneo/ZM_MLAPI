@@ -14,6 +14,7 @@ LP: str = "OpenCV DNN:"
 
 class CV2Base(FileLock):
     def __init__(self, model_config: Union[CV2YOLOModelConfig, CV2TFModelConfig, CV2HOGModelConfig]):
+        super().__init__()
         self.lock_name = ""
         self.lock_maximum = 0
         self.lock_dir = ""
@@ -28,6 +29,7 @@ class CV2Base(FileLock):
         self.net: Optional[cv2.dnn] = None
         self.model = None
         self.id = self.config.id
+
 
     @staticmethod
     def square_image(frame: np.ndarray):
